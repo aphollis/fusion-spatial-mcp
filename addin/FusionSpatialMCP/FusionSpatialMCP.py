@@ -774,6 +774,7 @@ def cmd_fusion_sketch_create(params):
             return str(k)
 
         curves = sk.sketchCurves
+        gc = sk.geometricConstraints
         for e in entities:
             t = str(e.get("type", ""))
             if t == "line":
@@ -783,6 +784,17 @@ def cmd_fusion_sketch_create(params):
                 lines = curves.sketchLines.addTwoPointRectangle(
                     pt(e["corner1"]), pt(e["corner2"]))
                 obj = [lines.item(i) for i in range(lines.count)]
+                # unlike the UI command, the API rectangle has NO geometric
+                # constraints - add the horizontal/vertical set so the rect
+                # carries design intent (verified live: constraints.count
+                # was 0 without this)
+                for ln in obj:
+                    d = ln.startSketchPoint.geometry.vectorTo(
+                        ln.endSketchPoint.geometry)
+                    if abs(d.x) >= abs(d.y):
+                        gc.addHorizontal(ln)
+                    else:
+                        gc.addVertical(ln)
             elif t == "circle":
                 obj = curves.sketchCircles.addByCenterRadius(
                     pt(e["center"]), float(e["radius"]) * inv)
@@ -797,8 +809,7 @@ def cmd_fusion_sketch_create(params):
                     % t)
             keyed(e, obj)
 
-        # constraints first (they position geometry), then dimensions
-        gc = sk.geometricConstraints
+        # explicit constraints (they position geometry), then dimensions
         for c in constraints:
             k = str(c.get("kind", ""))
             if k == "horizontal":
@@ -1008,16 +1019,28 @@ def cmd_fusion_feature_add(params):
             if not pts:
                 raise RuntimeError("Provide 'sketch' (handle) and 'points' "
                                    "(keys of sketch points).")
-            inp = feats.holeFeatures.createSimpleInput(
-                _vi(params.get("diameter"), des))
-            inp.setPositionBySketchPoints(_collection(pts))
             depth = params.get("depth", "through")
-            if str(depth) == "through":
-                inp.setAllExtent(
-                    adsk.fusion.ExtentDirections.NegativeExtentDirection)
-            else:
-                inp.setDistanceExtent(_vi(depth, des))
-            feature = feats.holeFeatures.add(inp)
+
+            def hole_input(direction):
+                inp = feats.holeFeatures.createSimpleInput(
+                    _vi(params.get("diameter"), des))
+                inp.setPositionBySketchPoints(_collection(pts))
+                if str(depth) == "through":
+                    inp.setAllExtent(direction)
+                else:
+                    inp.setDistanceExtent(_vi(depth, des))
+                return inp
+
+            # face sketches flip their normal, so which ExtentDirection
+            # points into the material varies - try positive, fall back
+            # (verified live: positive works on top-face sketches)
+            ED = adsk.fusion.ExtentDirections
+            try:
+                feature = feats.holeFeatures.add(
+                    hole_input(ED.PositiveExtentDirection))
+            except Exception:
+                feature = feats.holeFeatures.add(
+                    hole_input(ED.NegativeExtentDirection))
         elif ftype == "fillet":
             edges = _collection(_edges_of(des, params.get("edges")))
             inp = feats.filletFeatures.createInput()
@@ -1044,7 +1067,7 @@ def cmd_fusion_feature_add(params):
             feature = feats.shellFeatures.add(inp)
         elif ftype == "rectangularPattern":
             ents = _collection(_feature_entities(des, params))
-            PDT = adsk.fusion.PatternDistanceTypes
+            PDT = adsk.fusion.PatternDistanceType
             inp = feats.rectangularPatternFeatures.createInput(
                 ents, _axis_of(des, params.get("axisOne", "x")),
                 _vi(params.get("countOne", 2), des),
