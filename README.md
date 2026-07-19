@@ -10,11 +10,12 @@ clean, human-editable parametric models.
 The design is Fusion-first: tools are built around Fusion's own concepts
 (feature timeline, sketch constraints, user parameters, components), not
 adapted from any other CAD paradigm. Under the hood, the geometry-reading
-layer reuses the platform-neutral `spatial-core` engine (developed in
-[`rhino-gh-mcp`](../rhino-gh-mcp) on this machine): a CAD platform only has
-to provide two adapter functions (`bodies()` + `tessellate()`), validated by
-a checked-in JSON Schema conformance suite — spatial understanding of B-Rep
-solids is the same no matter how the geometry was authored.
+layer reuses the platform-neutral
+[`spatial-core`](https://github.com/aphollis/spatial-core) engine: a CAD
+platform only has to provide two adapter functions (`bodies()` +
+`tessellate()`), validated by that repo's JSON Schema conformance suite —
+spatial understanding of B-Rep solids is the same no matter how the
+geometry was authored.
 
 ```
 Claude ──stdio── Node MCP server ──TCP 127.0.0.1:8767── Fusion add-in (Python)
@@ -29,8 +30,9 @@ numerically by the spatial tools.
 
 ## Setup
 
-1. **Build the server** (Node 22+; the sibling `rhino-gh-mcp` repo must be
-   present for the `spatial-core` file: dependency):
+1. **Build the server** (Node 22+; the sibling
+   [`spatial-core`](https://github.com/aphollis/spatial-core) repo must be
+   cloned next to this one for the file: dependency):
 
    ```
    npm install
@@ -105,8 +107,8 @@ numerically by the spatial tools.
 
 - `node tools/call.mjs <method> [json | @file.py]` — raw wire calls
   (`ping`, `fusion.document`, `fusion.execute @script.py`, …)
-- `npm run conformance` — adapter conformance suite (JSON Schema contracts
-  in `contracts/`); must print `CONFORMANT`
+- `npm run conformance` — adapter conformance suite (canonical contracts +
+  suite live in the `spatial-core` package); must print `CONFORMANT`
 - `node tools/f2-checks.mjs` — volumes vs. Fusion physical properties +
   world-space proxy tessellation (needs the `tools/f2-scene.py` scene)
 - `node tools/f3-benchmark.mjs` — six-question spatial benchmark (≥5/6)

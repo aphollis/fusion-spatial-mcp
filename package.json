@@ -9,11 +9,11 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "conformance": "node tools/validate-protocol.mjs"
+    "conformance": "node node_modules/spatial-core/tools/validate-protocol.mjs 8767"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.0",
-    "spatial-core": "file:../rhino-gh-mcp/spatial",
+    "spatial-core": "file:../spatial-core",
     "zod": "^3.24.1"
   },
   "devDependencies": {
