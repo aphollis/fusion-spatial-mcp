@@ -6,9 +6,14 @@ the reference implementation. Follow its phase order (F0→F5); do not write
 spatial tool code before the F2 conformance gate passes.
 
 Hard rules:
-- The sibling project `C:\Users\nerfd\rhino-gh-mcp` is the working reference
-  implementation AND the home of `spatial-core` (consumed here via a `file:`
-  dependency — never fork/copy its source into this repo).
+- **Design Fusion-native.** This project is not a port of the Rhino server:
+  tool vocabulary, workflows, and agent guidance come from Fusion's own
+  concepts (timeline, features, constrained sketches, user parameters,
+  components). The sibling repo `C:\Users\nerfd\rhino-gh-mcp` is an
+  infrastructure donor only: it is the home of `spatial-core` (consumed via
+  `file:` dependency — never fork/copy its source) and a source of
+  engineering patterns (TCP bridge, threading, token efficiency). Do not
+  carry Grasshopper concepts or names across.
 - Never run generated code against the user's live Fusion session without
   asking first. Compile-check offline; batch live testing into agreed steps.
 - Fusion API traps: internal units are ALWAYS centimeters (convert to the

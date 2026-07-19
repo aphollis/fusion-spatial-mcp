@@ -1,17 +1,31 @@
 # fusion-spatial-mcp — Build Plan
 
-**Goal:** a Fusion 360 MCP server with the full spatial reasoning harness,
-porting the proven architecture of `C:\Users\nerfd\rhino-gh-mcp` (the sibling
-project). The spatial layer is REUSED, not rewritten: this project implements
-a thin platform adapter and Fusion-native creation tools.
+**Goal:** a Fusion 360 MCP server, designed Fusion-native, with the full
+spatial reasoning harness.
 
-This plan is written to be executed by an agent session with no prior context.
-Read the referenced files before implementing each phase. The Rhino repo on
-this machine is the working reference implementation of everything described.
+**Framing rule for this project:** Fusion is NOT "Rhino with a different
+API." Grasshopper authoring builds a live dataflow graph; Fusion authoring
+appends to a parametric feature timeline driven by named parameters and
+constrained sketches. Different verbs, different artifact, different editing
+model. Therefore:
+
+- The **geometry-reading layer is shared** — `spatial-core`, the wire
+  protocol, and the conformance suite operate on B-Rep solids and are
+  modality-blind. Consume them as infrastructure.
+- Everything **above** that line — creation tools, tool vocabulary, agent
+  guidance, workflows — is designed from Fusion's own concepts (timeline,
+  features, sketches + constraints, user parameters, components/occurrences).
+  Do not port Grasshopper concepts, names, or workflow shapes. When the
+  sibling repo is referenced below it is as an *infrastructure donor and
+  engineering-pattern source* (threading, TCP bridging, token efficiency),
+  never as a design template.
+
+This plan is written to be executed by an agent session with no prior
+context. Read the referenced files before implementing each phase.
 
 ---
 
-## 1. What already exists (do not rebuild)
+## 1. Shared infrastructure that already exists (do not rebuild)
 
 | Asset | Location | Role here |
 |---|---|---|
@@ -19,8 +33,8 @@ this machine is the working reference implementation of everything described.
 | Protocol contract | `C:\Users\nerfd\rhino-gh-mcp\spatial\PROTOCOL.md` | The wire protocol + TS API this project must satisfy. §1 defines the exact two commands the Fusion add-in must implement. |
 | JSON Schema contracts | `contracts/*.schema.json` (copied into THIS repo, canonical copy in rhino-gh-mcp) | Adapter conformance shapes for `space.bodies` / `space.tessellate`. |
 | Conformance suite | `tools/validate-protocol.mjs` (copied here) | Run against the Fusion add-in's listener; it must print CONFORMANT. This is the acceptance gate for Phase F2. Needs `npm i -D ajv`. |
-| Reference MCP server | `C:\Users\nerfd\rhino-gh-mcp\src\` | `index.ts` (tool registration patterns, annotations, spatial section), `bridge.ts` (TCP JSON-lines client), `spatial-adapter.ts` (base64 → typed arrays). Port these shapes. |
-| Reference listener | `C:\Users\nerfd\rhino-gh-mcp\rhino\mcp_listener.py` | The in-app bridge pattern: JSON-lines TCP server, thread-per-connection, UI-thread marshaling, sceneVersion in dispatcher, `space.*` handlers. |
+| Engineering patterns (MCP server) | `C:\Users\nerfd\rhino-gh-mcp\src\` | `bridge.ts` (TCP JSON-lines client), `spatial-adapter.ts` (base64 → typed arrays), `index.ts` spatial-tool section + annotation style. Reuse the *mechanics*; the Fusion tool vocabulary is designed fresh in §4. |
+| Engineering patterns (in-app bridge) | `C:\Users\nerfd\rhino-gh-mcp\rhino\mcp_listener.py` | JSON-lines TCP server, thread-per-connection, main-thread marshaling, sceneVersion in dispatcher, `space.*` handlers. Same mechanics apply; the command surface beyond `space.*` is Fusion's own. |
 | Ecosystem survey | `C:\Users\nerfd\rhino-gh-mcp\docs\community-mcp-survey.md` | Prior art. Key: Autodesk's MIT **FusionMCPSample** (CustomEvent threading to copy), ndoo/fusion360-mcp-bridge (best threading docs + Bearer auth), faust-machines (84-tool reference, MIT). Do NOT copy GPL (Joe-Spencer) or unlicensed code. |
 | Design rationale | `C:\Users\nerfd\rhino-gh-mcp\docs\RFD-001-spatial-reasoning.md` | Why the adapter is only two functions; §8b has Fusion-specific notes. |
 | Token-efficiency playbook | `C:\Users\nerfd\rhino-gh-mcp\docs\EFFICIENCY_PLAN.md` | Apply the same rules here from day one (alwaysLoad, cached static context, terse returns, handles, idempotency). |
@@ -102,38 +116,66 @@ sockets must fail bind loudly — hard-won lesson).
 
 ## 4. Tool surface
 
-### Phase A — spatial + read-only (the differentiator; ship first)
-Identical names and schemas to the Rhino server (port from
-`rhino-gh-mcp/src/index.ts`, spatial section):
+### The Fusion mental model (drives every tool decision)
+
+In Fusion, the design **is** the timeline: an ordered history of features
+(sketch → extrude → hole → fillet → pattern ...) whose dimensions are driven
+by named, unit-aware **user parameters** with expressions (`width/2 + 3 mm`),
+organized into **components** joined in assemblies. A good Fusion agent does
+not just produce geometry — it authors a *clean, human-editable parametric
+model*: well-named parameters, constrained sketches, sensible feature order.
+Editing means driving parameters or revising features in place and letting
+the timeline recompute — not rebuilding. The agent's quality bar is "would a
+mechanical designer be happy to inherit this timeline?"
+
+### Phase A — spatial + read-only understanding (ship first)
+The `space_*` toolset comes from spatial-core through the adapter with zero
+new geometry code — spatial understanding of solids is modality-independent:
 `space_digest, space_measure, space_relations, space_voxels, space_section,
-space_views, space_fit, space_pick` — all served by spatial-core through the
-FusionGeometryAdapter; ZERO new geometry code.
-Plus Fusion-native read-only: `fusion_scene_info` (doc name, units, up-axis,
-body/component/timeline counts), `fusion_get_selection` (entityTokens + bboxes
-of `ui.activeSelections`), `fusion_capture_viewport` (
-`app.activeViewport.saveAsImageFile` → PNG base64).
+space_views, space_fit, space_pick`.
+Fusion-native read-only tools:
+- `fusion_document` — doc name, units, up-axis, components, body counts, and
+  a **timeline summary** (feature list with names/types/health/suppression) —
+  the agent's primary orientation call; the timeline IS the scene graph here.
+- `fusion_get_selection` — entityTokens + kinds + bboxes of
+  `ui.activeSelections` (resolves "this face/body/feature").
+- `fusion_capture_viewport` — `app.activeViewport.saveAsImageFile` → PNG.
 
-### Phase B — creation & parametrics
-- `fusion_execute_api_script` — escape hatch (every server has one; ours is
-  not the centerpiece). `adsk` preloaded, stdout captured, `result` variable
-  returned. destructiveHint: true.
-- `fusion_set_parameter` / `fusion_list_parameters` — **user parameters are
-  Fusion's sliders**; driving them IS parametric design here. Get/set by name
-  with unit-aware values. This is the highest-leverage creation tool.
-- `fusion_build_features` — the recipe analog: ONE declarative call that
-  executes a list of feature ops `[{op:"sketch_rect", plane, w, h, key},
-  {op:"extrude", profileOf:key, distance, operation}, {op:"hole_pattern",
-  face, dias, grid}, {op:"fillet", edgesOf, radius}]` with keys → entityTokens
-  returned (the handle system ported). Idempotency v1: NOT attempted (timeline
-  semantics differ from a GH canvas); instead return created tokens and make
-  re-runs append — document this honestly.
-- sceneVersion bumps in the dispatcher on every mutating method (same list
-  discipline as the Rhino listener).
+### Phase B — parametric authoring (Fusion-native by design)
+- `fusion_list_parameters` / `fusion_set_parameters` — read and drive user +
+  model parameters by name, with unit-aware values AND expressions. Driving
+  parameters is the primary editing verb in Fusion; setting several at once
+  (batch) with a single recompute + health report.
+- `fusion_create_sketch` — create a sketch on a plane/face (by entityToken)
+  with entities (lines/arcs/circles/rects/points) plus **dimensions and
+  constraints** — constraints are what make a sketch design-intent rather
+  than dumb curves; the tool should encourage fully-defined sketches and
+  report the under-constrained count back.
+- `fusion_add_feature` — one timeline feature per call: extrude, revolve,
+  hole, fillet, chamfer, shell, rectangular/circular pattern, mirror, combine.
+  References by entityToken (profiles, faces, edges); dimension inputs accept
+  parameter expressions, and the tool can create named user parameters
+  on the fly (`{"distance": {"param": "wall_height", "value": "40 mm"}}`) so
+  models come out parametric by default.
+- `fusion_edit_feature` — modify an existing timeline feature's inputs in
+  place (the Fusion-native "change it" — recompute + downstream health).
+- `fusion_timeline` — full introspection: features in order, their consumed
+  parameters/references, errors/warnings after recompute, rollback marker;
+  plus `fusion_rollback` to move the marker for mid-history edits.
+- `fusion_execute_api_script` — the escape hatch (`adsk` preloaded, stdout
+  captured, `result` returned; destructiveHint). Present because every gap
+  needs a relief valve — not the centerpiece.
+- sceneVersion bumps in the dispatcher on every mutating method.
 
-### Phase C — polish / later
-Chat palette inside Fusion (HTML palette hosting the same agent backend
-pattern as the Rhino panel), templates library, `fusion_undo`, timeline
-introspection tools.
+Deliberately NOT in scope v1: canvas-style batch "build a whole design in one
+call". Fusion's timeline semantics make stepwise feature authoring with
+health checks after each step the more faithful (and debuggable) shape; a
+batch layer can be added later if turn-count metrics justify it.
+
+### Phase C — later
+Assemblies (occurrences, joints, joint limits), appearance/materials, drawing
+export, an in-Fusion chat palette (HTML palette + local agent backend),
+`fusion_undo`.
 
 All tools carry MCP annotations (readOnlyHint/destructiveHint/idempotentHint)
 from day one, and register with `alwaysLoad` semantics in any agent backend.
@@ -147,8 +189,8 @@ from day one, and register with `alwaysLoad` semantics in any agent backend.
 | F0 | Repo scaffold: package.json (file: dep on ../rhino-gh-mcp/spatial, ajv devDep), tsconfig, src/bridge.ts + src/index.ts skeleton compiling; add-in skeleton that loads in Fusion and logs to the TEXT COMMANDS palette | `npm run build` clean; add-in appears in Fusion Scripts & Add-Ins and survives run/stop cycles |
 | F1 | Listener online: TCP 8767, ping, `fusion.scene` info, CustomEvent main-thread marshaling proven | `ping` → `pong` from a node script; scene info correct with a doc open |
 | F2 | **Adapter conformance:** `space.bodies` + `space.tessellate` with units/up-axis/entityToken/assembly handling | `node tools/validate-protocol.mjs` (RHINO_MCP_PORT=8767) prints CONFORMANT against a test doc incl. one assembly with 2 occurrences; volumes match Fusion's own physical properties to 4 sig figs |
-| F3 | Full Phase-A tool surface wired in the MCP server | Spatial benchmark port: recreate the rhino bench ground-truth scene in Fusion (two spheres, hollow box, tall cylinder — via an execute script), run the six RFD questions through a client; target ≥5/6 |
-| F4 | Phase-B creation tools + sceneVersion | Build a parametric bracket via `fusion_build_features` + drive it via `fusion_set_parameter`; spatial tools verify the result numerically |
+| F3 | Full Phase-A tool surface wired in the MCP server | Spatial benchmark: create the shared ground-truth scene (two spheres, hollow box with 2-unit walls, tall cylinder — via an execute script), run the six spatial questions through a client; target ≥5/6 |
+| F4 | Phase-B authoring tools + sceneVersion | Author a parametric bracket as a clean timeline (constrained sketch → extrude → hole pattern → fillet) with named user parameters; then resize it purely via `fusion_set_parameters`; spatial tools verify dimensions numerically; timeline health clean |
 | F5 | Docs, README, annotations audit, error-message polish | A cold Claude Code session with only this repo's README + MCP registration can drive Fusion successfully |
 | F6 | (Optional) Extract spatial-core to its own repo consumed by both projects | Both repos build against the extracted package |
 

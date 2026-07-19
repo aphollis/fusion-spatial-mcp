@@ -3,13 +3,18 @@
 An MCP server that gives AI agents **genuine 3D spatial understanding of
 Autodesk Fusion 360** — exact measurements, collision/clearance/containment,
 volumetric occupancy, section cuts, engineering multiviews, and free-space
-placement search — plus parametric creation tools.
+placement search — plus **Fusion-native parametric authoring**: constrained
+sketches, timeline features, and named user parameters, aimed at producing
+clean, human-editable parametric models.
 
-This is the Fusion implementation of the spatial architecture proven in the
-sibling project [`rhino-gh-mcp`](../rhino-gh-mcp) (same machine): a
-platform-neutral `spatial-core` engine where each CAD platform only has to
-provide two adapter functions (`bodies()` + `tessellate()`), validated by a
-checked-in JSON Schema conformance suite.
+The design is Fusion-first: tools are built around Fusion's own concepts
+(feature timeline, sketch constraints, user parameters, components), not
+adapted from any other CAD paradigm. Under the hood, the geometry-reading
+layer reuses the platform-neutral `spatial-core` engine (developed in
+[`rhino-gh-mcp`](../rhino-gh-mcp) on this machine): a CAD platform only has
+to provide two adapter functions (`bodies()` + `tessellate()`), validated by
+a checked-in JSON Schema conformance suite — spatial understanding of B-Rep
+solids is the same no matter how the geometry was authored.
 
 **Status: planning.** The build plan is in
 [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md). Architecture in one line:
