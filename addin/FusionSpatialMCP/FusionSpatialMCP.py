@@ -57,9 +57,11 @@ _listener = None
 # caches meshes/BVH keyed by (id, sceneVersion).
 SCENE_VERSION = 1
 
-# Mutating methods bump SCENE_VERSION; the rest of the Phase-B authoring
-# surface joins this set at F4.
-MUTATING_METHODS = set(["fusion.execute"])
+# Mutating methods bump SCENE_VERSION after each successful call.
+MUTATING_METHODS = set([
+    "fusion.execute", "fusion.params.set", "fusion.sketch.create",
+    "fusion.feature.add", "fusion.feature.edit", "fusion.rollback",
+])
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +476,747 @@ def cmd_space_tessellate(params):
     return run_on_main(work)
 
 
+# --------------------------------------------------------------------------- #
+# Phase-B authoring: parameters, sketches, features, timeline
+# --------------------------------------------------------------------------- #
+
+_SKETCHES = {}      # sketch handle "s1" -> sketch entityToken
+_SKETCH_KEYS = {}   # (sketch_handle, entity_key) -> entityToken
+_next_sketch = [1]
+
+
+def _expr_of(spec, des):
+    """Expression string from a dimension/extent spec: number (doc units),
+    expression string ("40 mm", "width/2"), or {"param": name, "value": expr}
+    which creates the named user parameter on the fly (models come out
+    parametric by default)."""
+    if isinstance(spec, dict):
+        name = spec.get("param")
+        val = spec.get("value")
+        if not name:
+            raise RuntimeError("param spec needs a 'param' name.")
+        ups = des.userParameters
+        if ups.itemByName(name) is None:
+            unit = des.unitsManager.defaultLengthUnits
+            ups.add(name, adsk.core.ValueInput.createByString(str(val)),
+                    unit, "")
+        return str(name)
+    return str(spec)
+
+
+def _vi(spec, des):
+    """ValueInput from a spec (see _expr_of). Strings parse in doc units."""
+    return adsk.core.ValueInput.createByString(_expr_of(spec, des))
+
+
+def _plane_of(des, spec):
+    root = des.rootComponent
+    named = {"xy": root.xYConstructionPlane,
+             "xz": root.xZConstructionPlane,
+             "yz": root.yZConstructionPlane}
+    s = str(spec or "xy").lower()
+    if s in named:
+        return named[s]
+    ents = des.findEntityByToken(str(spec))
+    for e in (ents or []):
+        face = adsk.fusion.BRepFace.cast(e)
+        if face is not None:
+            return face
+        cp = adsk.fusion.ConstructionPlane.cast(e)
+        if cp is not None:
+            return cp
+    raise RuntimeError(
+        "Unknown sketch plane '%s' (use 'xy'/'xz'/'yz' or a planar face "
+        "entityToken from fusion_get_selection)." % spec)
+
+
+def _axis_of(des, spec):
+    root = des.rootComponent
+    named = {"x": root.xConstructionAxis,
+             "y": root.yConstructionAxis,
+             "z": root.zConstructionAxis}
+    s = str(spec).lower()
+    if s in named:
+        return named[s]
+    ents = des.findEntityByToken(str(spec))
+    for e in (ents or []):
+        for t in (adsk.fusion.ConstructionAxis, adsk.fusion.SketchLine,
+                  adsk.fusion.BRepEdge):
+            c = t.cast(e)
+            if c is not None:
+                return c
+    raise RuntimeError("Unknown axis '%s' (use 'x'/'y'/'z' or an entityToken "
+                       "of an edge/sketch line/construction axis)." % spec)
+
+
+def _find_sketch(des, handle):
+    token = _SKETCHES.get(str(handle), str(handle))
+    ents = des.findEntityByToken(token)
+    for e in (ents or []):
+        sk = adsk.fusion.Sketch.cast(e)
+        if sk is not None:
+            return sk
+    raise RuntimeError("Unknown sketch '%s'. Known: %s" %
+                       (handle, ", ".join(sorted(_SKETCHES.keys())) or "(none)"))
+
+
+def _profiles_of(des, spec):
+    """Resolve 'pN' profile refs: "s1" (all profiles) or "s1:0"."""
+    s = str(spec)
+    idx = None
+    if ":" in s:
+        s, i = s.rsplit(":", 1)
+        idx = int(i)
+    sk = _find_sketch(des, s)
+    profs = sk.profiles
+    if profs.count == 0:
+        raise RuntimeError("Sketch '%s' has no closed profiles." % spec)
+    if idx is not None:
+        if idx >= profs.count:
+            raise RuntimeError("Sketch '%s' has %d profiles; index %d is out "
+                               "of range." % (s, profs.count, idx))
+        return [profs.item(idx)]
+    return [profs.item(i) for i in range(profs.count)]
+
+
+def _find_feature(des, spec):
+    """Resolve a timeline feature by name or index."""
+    tl = des.timeline
+    s = str(spec)
+    if s.lstrip("-").isdigit():
+        i = int(s)
+        if i < 0:
+            i += tl.count
+        return tl.item(i)
+    for i in range(tl.count):
+        if tl.item(i).name == s:
+            return tl.item(i)
+    raise RuntimeError("No timeline feature named '%s'. Call fusion_timeline "
+                       "for the current list." % s)
+
+
+def _collection(items):
+    col = adsk.core.ObjectCollection.create()
+    for it in items:
+        col.add(it)
+    return col
+
+
+def _health(des):
+    """Compact post-mutation health report: unhealthy timeline items only."""
+    issues = []
+    try:
+        if des.designType == adsk.fusion.DesignTypes.ParametricDesignType:
+            tl = des.timeline
+            for i in range(tl.count):
+                item = tl.item(i)
+                try:
+                    h = _HEALTH_NAMES.get(int(item.healthState), "unknown")
+                except Exception:
+                    continue
+                if h in ("warning", "error"):
+                    entry = {"feature": item.name, "health": h}
+                    try:
+                        msg = item.errorOrWarningMessage
+                        if msg:
+                            entry["message"] = msg
+                    except Exception:
+                        pass
+                    issues.append(entry)
+    except Exception:
+        pass
+    return {"timelineHealth": issues if issues else "ok",
+            "sceneVersion": SCENE_VERSION + 1}  # +1: dispatcher bumps after
+
+
+def _body_handles(feature):
+    out = []
+    try:
+        for i in range(feature.bodies.count):
+            out.append(_handle_for(feature.bodies.item(i).entityToken))
+    except Exception:
+        pass
+    return out
+
+
+def _param_info(p, um):
+    entry = {"name": p.name, "expression": p.expression, "unit": p.unit}
+    try:
+        entry["value"] = um.formatInternalValue(p.value, p.unit, False) \
+            if p.unit else _round4(p.value)
+    except Exception:
+        pass
+    try:
+        if p.comment:
+            entry["comment"] = p.comment
+    except Exception:
+        pass
+    return entry
+
+
+def cmd_fusion_params_list(params):
+    include_model = bool(params.get("includeModel"))
+
+    def work():
+        des = _design()
+        um = des.unitsManager
+        out = {"userParameters": [_param_info(des.userParameters.item(i), um)
+                                  for i in range(des.userParameters.count)]}
+        if include_model:
+            model = []
+            aps = des.allParameters
+            for i in range(aps.count):
+                p = aps.item(i)
+                mp = adsk.fusion.ModelParameter.cast(p)
+                if mp is None:
+                    continue
+                entry = _param_info(p, um)
+                try:
+                    entry["role"] = mp.role
+                    entry["feature"] = mp.createdBy.name
+                except Exception:
+                    pass
+                model.append(entry)
+            out["modelParameters"] = model
+        return out
+
+    return run_on_main(work)
+
+
+def cmd_fusion_params_set(params):
+    values = params.get("params")
+    if not isinstance(values, dict) or not values:
+        raise RuntimeError("'params' must be a non-empty {name: expression} "
+                           "object.")
+
+    def work():
+        des = _design()
+        um = des.unitsManager
+        updated = []
+        for name, expr in values.items():
+            p = des.userParameters.itemByName(str(name))
+            if p is None:
+                p = des.allParameters.itemByName(str(name))
+            if p is None:
+                # unknown name -> create a user parameter (parametric by
+                # default); use an explicit unit-suffixed expression to
+                # control the unit.
+                p = des.userParameters.add(
+                    str(name),
+                    adsk.core.ValueInput.createByString(str(expr)),
+                    um.defaultLengthUnits, "")
+            else:
+                p.expression = str(expr)
+            updated.append(_param_info(p, um))
+        r = {"updated": updated}
+        r.update(_health(des))
+        return r
+
+    return run_on_main(work)
+
+
+def _sketch_ref(sk, made, ref):
+    """Resolve an entity reference inside a sketch.create call:
+    'origin' | key | key.start/.end/.center | rectKey.N[.start/.end]"""
+    s = str(ref)
+    if s == "origin":
+        return sk.originPoint
+    parts = s.split(".")
+    obj = made.get(parts[0])
+    if obj is None:
+        raise RuntimeError("Unknown entity key '%s'. Known: %s" %
+                           (parts[0], ", ".join(sorted(made.keys()))))
+    for part in parts[1:]:
+        if part.isdigit():          # rectangle line index
+            obj = obj[int(part)]
+        elif part == "start":
+            obj = obj.startSketchPoint
+        elif part == "end":
+            obj = obj.endSketchPoint
+        elif part == "center":
+            obj = obj.centerSketchPoint
+        else:
+            raise RuntimeError("Unknown entity suffix '.%s' in '%s'." %
+                               (part, s))
+    return obj
+
+
+def cmd_fusion_sketch_create(params):
+    plane = params.get("plane", "xy")
+    name = params.get("name")
+    entities = params.get("entities") or []
+    dimensions = params.get("dimensions") or []
+    constraints = params.get("constraints") or []
+
+    def work():
+        des = _design()
+        unit, f = _unit_factor(des)
+        inv = 1.0 / f  # doc units -> cm
+        root = des.rootComponent
+        sk = root.sketches.add(_plane_of(des, plane))
+        if name:
+            sk.name = str(name)
+
+        P = adsk.core.Point3D.create
+
+        def pt(xy):
+            return P(float(xy[0]) * inv, float(xy[1]) * inv, 0)
+
+        made = {}
+        auto = [0]
+
+        def keyed(spec, obj):
+            k = spec.get("key")
+            if not k:
+                auto[0] += 1
+                k = "e%d" % auto[0]
+            made[str(k)] = obj
+            return str(k)
+
+        curves = sk.sketchCurves
+        for e in entities:
+            t = str(e.get("type", ""))
+            if t == "line":
+                obj = curves.sketchLines.addByTwoPoints(
+                    pt(e["from"]), pt(e["to"]))
+            elif t == "rect":
+                lines = curves.sketchLines.addTwoPointRectangle(
+                    pt(e["corner1"]), pt(e["corner2"]))
+                obj = [lines.item(i) for i in range(lines.count)]
+            elif t == "circle":
+                obj = curves.sketchCircles.addByCenterRadius(
+                    pt(e["center"]), float(e["radius"]) * inv)
+            elif t == "arc":
+                obj = curves.sketchArcs.addByThreePoints(
+                    pt(e["from"]), pt(e["through"]), pt(e["to"]))
+            elif t == "point":
+                obj = sk.sketchPoints.add(pt(e["at"]))
+            else:
+                raise RuntimeError(
+                    "Unknown entity type '%s' (line|rect|circle|arc|point)."
+                    % t)
+            keyed(e, obj)
+
+        # constraints first (they position geometry), then dimensions
+        gc = sk.geometricConstraints
+        for c in constraints:
+            k = str(c.get("kind", ""))
+            if k == "horizontal":
+                gc.addHorizontal(_sketch_ref(sk, made, c["of"]))
+            elif k == "vertical":
+                gc.addVertical(_sketch_ref(sk, made, c["of"]))
+            elif k == "coincident":
+                gc.addCoincident(_sketch_ref(sk, made, c["a"]),
+                                 _sketch_ref(sk, made, c["b"]))
+            elif k == "concentric":
+                gc.addConcentric(_sketch_ref(sk, made, c["a"]),
+                                 _sketch_ref(sk, made, c["b"]))
+            elif k == "equal":
+                gc.addEqual(_sketch_ref(sk, made, c["a"]),
+                            _sketch_ref(sk, made, c["b"]))
+            elif k == "tangent":
+                gc.addTangent(_sketch_ref(sk, made, c["a"]),
+                              _sketch_ref(sk, made, c["b"]))
+            elif k == "parallel":
+                gc.addParallel(_sketch_ref(sk, made, c["a"]),
+                               _sketch_ref(sk, made, c["b"]))
+            elif k == "perpendicular":
+                gc.addPerpendicular(_sketch_ref(sk, made, c["a"]),
+                                    _sketch_ref(sk, made, c["b"]))
+            elif k == "midpoint":
+                gc.addMidPoint(_sketch_ref(sk, made, c["point"]),
+                               _sketch_ref(sk, made, c["line"]))
+            else:
+                raise RuntimeError("Unknown constraint kind '%s'." % k)
+
+        dims = sk.sketchDimensions
+        DO = adsk.fusion.DimensionOrientations
+        orient_map = {"horizontal": DO.HorizontalDimensionOrientation,
+                      "vertical": DO.VerticalDimensionOrientation,
+                      "aligned": DO.AlignedDimensionOrientation}
+        text_off = [0]
+        for d in dimensions:
+            k = str(d.get("kind", ""))
+            text_off[0] += 1.0
+            tp = P(text_off[0], -1.0 - text_off[0] * 0.5, 0)
+            if k == "distance":
+                if "of" in d:  # length of a line
+                    line = _sketch_ref(sk, made, d["of"])
+                    a, b = line.startSketchPoint, line.endSketchPoint
+                else:
+                    a = _sketch_ref(sk, made, d["a"])
+                    b = _sketch_ref(sk, made, d["b"])
+                orient = orient_map.get(str(d.get("orientation", "aligned")),
+                                        DO.AlignedDimensionOrientation)
+                dim = dims.addDistanceDimension(a, b, orient, tp)
+            elif k == "diameter":
+                dim = dims.addDiameterDimension(
+                    _sketch_ref(sk, made, d["of"]), tp)
+            elif k == "radius":
+                dim = dims.addRadialDimension(
+                    _sketch_ref(sk, made, d["of"]), tp)
+            else:
+                raise RuntimeError(
+                    "Unknown dimension kind '%s' (distance|diameter|radius)."
+                    % k)
+            if d.get("value") is not None:
+                dim.parameter.expression = _expr_of(d["value"], des)
+
+        # register handle + keyed entity tokens for later feature calls
+        h = "s%d" % _next_sketch[0]
+        _next_sketch[0] += 1
+        _SKETCHES[h] = sk.entityToken
+        for k, obj in made.items():
+            try:
+                if isinstance(obj, list):
+                    for i, o in enumerate(obj):
+                        _SKETCH_KEYS[(h, "%s.%d" % (k, i))] = o.entityToken
+                else:
+                    _SKETCH_KEYS[(h, k)] = obj.entityToken
+            except Exception:
+                pass
+
+        profs = sk.profiles
+        profiles = []
+        for i in range(profs.count):
+            entry = {"id": "%s:%d" % (h, i)}
+            try:
+                entry["area"] = _round4(
+                    profs.item(i).areaProperties().area * f ** 2)
+            except Exception:
+                pass
+            profiles.append(entry)
+        r = {"sketch": h, "name": sk.name,
+             "fullyConstrained": bool(sk.isFullyConstrained),
+             "profiles": profiles,
+             "keys": sorted(made.keys())}
+        r.update(_health(des))
+        return r
+
+    return run_on_main(work)
+
+
+_OPERATIONS = {
+    "new": "NewBodyFeatureOperation",
+    "join": "JoinFeatureOperation",
+    "cut": "CutFeatureOperation",
+    "intersect": "IntersectFeatureOperation",
+    "newComponent": "NewComponentFeatureOperation",
+}
+
+
+def _operation_of(spec):
+    FO = adsk.fusion.FeatureOperations
+    key = _OPERATIONS.get(str(spec or "new"))
+    if key is None:
+        raise RuntimeError("Unknown operation '%s' (%s)." %
+                           (spec, "|".join(sorted(_OPERATIONS))))
+    return getattr(FO, key)
+
+
+def _edges_of(des, spec):
+    """Edge set for fillet/chamfer: list of entityTokens, or a filter
+    {"body": handle, "parallelTo": "x|y|z"} / {"body": handle} (all edges)."""
+    if isinstance(spec, list):
+        out = []
+        for token in spec:
+            ents = des.findEntityByToken(str(token))
+            for e in (ents or []):
+                edge = adsk.fusion.BRepEdge.cast(e)
+                if edge is not None:
+                    out.append(edge)
+                    break
+        if not out:
+            raise RuntimeError("No edges resolved from the given tokens.")
+        return out
+    if isinstance(spec, dict) and spec.get("body"):
+        body = _find_body(des, spec["body"])
+        axis = spec.get("parallelTo")
+        out = []
+        for i in range(body.edges.count):
+            edge = body.edges.item(i)
+            if axis:
+                line = adsk.core.Line3D.cast(edge.geometry)
+                if line is None:
+                    continue
+                v = line.startPoint.vectorTo(line.endPoint)
+                v.normalize()
+                want = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}[
+                    str(axis).lower()]
+                dot = abs(v.x * want[0] + v.y * want[1] + v.z * want[2])
+                if dot < 0.999:
+                    continue
+            out.append(edge)
+        if not out:
+            raise RuntimeError("No edges of body '%s' matched the filter."
+                               % spec["body"])
+        return out
+    raise RuntimeError("'edges' must be a token list or "
+                       "{'body': handle, 'parallelTo': 'x|y|z'}.")
+
+
+def _feature_entities(des, params):
+    """Bodies and/or features referenced by a pattern/mirror call."""
+    items = []
+    for h in (params.get("bodies") or []):
+        items.append(_find_body(des, h))
+    for nm in (params.get("features") or []):
+        items.append(_find_feature(des, nm).entity)
+    if not items:
+        raise RuntimeError("Provide 'bodies' (handles) and/or 'features' "
+                           "(timeline names).")
+    return items
+
+
+def cmd_fusion_feature_add(params):
+    ftype = str(params.get("type", ""))
+
+    def work():
+        des = _design()
+        root = des.rootComponent
+        feats = root.features
+        op = _operation_of(params.get("operation"))
+
+        if ftype == "extrude":
+            profs = _collection(_profiles_of(des, params.get("profile")))
+            inp = feats.extrudeFeatures.createInput(profs, op)
+            inp.setDistanceExtent(bool(params.get("symmetric")),
+                                  _vi(params.get("distance"), des))
+            feature = feats.extrudeFeatures.add(inp)
+        elif ftype == "revolve":
+            profs = _collection(_profiles_of(des, params.get("profile")))
+            inp = feats.revolveFeatures.createInput(
+                profs, _axis_of(des, params.get("axis", "z")), op)
+            inp.setAngleExtent(bool(params.get("symmetric")),
+                               _vi(params.get("angle", "360 deg"), des))
+            feature = feats.revolveFeatures.add(inp)
+        elif ftype == "hole":
+            sk_h = params.get("sketch")
+            keys = params.get("points") or []
+            pts = []
+            for k in keys:
+                token = _SKETCH_KEYS.get((str(sk_h), str(k)))
+                if token is None:
+                    raise RuntimeError(
+                        "Unknown sketch point '%s' in sketch '%s'." %
+                        (k, sk_h))
+                for e in (des.findEntityByToken(token) or []):
+                    sp = adsk.fusion.SketchPoint.cast(e)
+                    if sp is not None:
+                        pts.append(sp)
+                        break
+            if not pts:
+                raise RuntimeError("Provide 'sketch' (handle) and 'points' "
+                                   "(keys of sketch points).")
+            inp = feats.holeFeatures.createSimpleInput(
+                _vi(params.get("diameter"), des))
+            inp.setPositionBySketchPoints(_collection(pts))
+            depth = params.get("depth", "through")
+            if str(depth) == "through":
+                inp.setAllExtent(
+                    adsk.fusion.ExtentDirections.NegativeExtentDirection)
+            else:
+                inp.setDistanceExtent(_vi(depth, des))
+            feature = feats.holeFeatures.add(inp)
+        elif ftype == "fillet":
+            edges = _collection(_edges_of(des, params.get("edges")))
+            inp = feats.filletFeatures.createInput()
+            inp.edgeSetInputs.addConstantRadiusEdgeSet(
+                edges, _vi(params.get("radius"), des), True)
+            feature = feats.filletFeatures.add(inp)
+        elif ftype == "chamfer":
+            edges = _collection(_edges_of(des, params.get("edges")))
+            inp = feats.chamferFeatures.createInput(edges, True)
+            inp.setToEqualDistance(_vi(params.get("distance"), des))
+            feature = feats.chamferFeatures.add(inp)
+        elif ftype == "shell":
+            body = _find_body(des, params.get("body"))
+            faces = []
+            for token in (params.get("removeFaces") or []):
+                for e in (des.findEntityByToken(str(token)) or []):
+                    fc = adsk.fusion.BRepFace.cast(e)
+                    if fc is not None:
+                        faces.append(fc)
+                        break
+            inp = feats.shellFeatures.createInput(
+                _collection(faces if faces else [body]), False)
+            inp.insideThickness = _vi(params.get("thickness"), des)
+            feature = feats.shellFeatures.add(inp)
+        elif ftype == "rectangularPattern":
+            ents = _collection(_feature_entities(des, params))
+            PDT = adsk.fusion.PatternDistanceTypes
+            inp = feats.rectangularPatternFeatures.createInput(
+                ents, _axis_of(des, params.get("axisOne", "x")),
+                _vi(params.get("countOne", 2), des),
+                _vi(params.get("spacingOne"), des),
+                PDT.SpacingPatternDistanceType)
+            if params.get("axisTwo"):
+                inp.setDirectionTwo(
+                    _axis_of(des, params.get("axisTwo")),
+                    _vi(params.get("countTwo", 2), des),
+                    _vi(params.get("spacingTwo"), des))
+            feature = feats.rectangularPatternFeatures.add(inp)
+        elif ftype == "circularPattern":
+            ents = _collection(_feature_entities(des, params))
+            inp = feats.circularPatternFeatures.createInput(
+                ents, _axis_of(des, params.get("axis", "z")))
+            inp.quantity = _vi(params.get("count", 4), des)
+            inp.totalAngle = _vi(params.get("totalAngle", "360 deg"), des)
+            feature = feats.circularPatternFeatures.add(inp)
+        elif ftype == "mirror":
+            ents = _collection(_feature_entities(des, params))
+            inp = feats.mirrorFeatures.createInput(
+                ents, _plane_of(des, params.get("plane")))
+            feature = feats.mirrorFeatures.add(inp)
+        elif ftype == "combine":
+            target = _find_body(des, params.get("target"))
+            tools = _collection(
+                [_find_body(des, h) for h in (params.get("tools") or [])])
+            inp = feats.combineFeatures.createInput(target, tools)
+            inp.operation = _operation_of(params.get("operation", "join"))
+            inp.isKeepToolBodies = bool(params.get("keepTools"))
+            feature = feats.combineFeatures.add(inp)
+        else:
+            raise RuntimeError(
+                "Unknown feature type '%s' (extrude|revolve|hole|fillet|"
+                "chamfer|shell|rectangularPattern|circularPattern|mirror|"
+                "combine)." % ftype)
+
+        if params.get("name"):
+            try:
+                feature.name = str(params["name"])
+            except Exception:
+                pass
+        r = {"feature": feature.name,
+             "type": ftype,
+             "bodies": _body_handles(feature)}
+        r.update(_health(des))
+        return r
+
+    return run_on_main(work)
+
+
+def cmd_fusion_feature_edit(params):
+    spec = params.get("feature")
+
+    def work():
+        des = _design()
+        um = des.unitsManager
+        item = _find_feature(des, spec)
+        feature = item.entity
+        changed = []
+        sets = params.get("set") or {}
+        if sets:
+            # a feature's dimensions are its model parameters; editing in
+            # Fusion = driving parameters (match by role or name)
+            mine = []
+            aps = des.allParameters
+            for i in range(aps.count):
+                mp = adsk.fusion.ModelParameter.cast(aps.item(i))
+                if mp is not None and mp.createdBy is not None \
+                        and mp.createdBy == feature:
+                    mine.append(mp)
+            for key, expr in sets.items():
+                k = str(key).lower()
+                match = None
+                for mp in mine:
+                    if mp.name.lower() == k or (mp.role or "").lower() == k:
+                        match = mp
+                        break
+                if match is None:
+                    raise RuntimeError(
+                        "Feature '%s' has no parameter '%s'. Available: %s"
+                        % (item.name, key,
+                           ", ".join("%s (%s)" % (m.role or m.name, m.name)
+                                     for m in mine) or "(none)"))
+                match.expression = _expr_of(expr, des)
+                changed.append(_param_info(match, um))
+        if params.get("suppress") is not None:
+            item.isSuppressed = bool(params["suppress"])
+        if params.get("name") and params["name"] != item.name:
+            feature.name = str(params["name"])
+        r = {"feature": item.name, "updated": changed}
+        r.update(_health(des))
+        return r
+
+    return run_on_main(work)
+
+
+def cmd_fusion_timeline(params):
+    def work():
+        des = _design()
+        um = des.unitsManager
+        if des.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+            return {"designType": "direct", "timeline": []}
+        # group model parameters by owning feature (one pass)
+        by_feature = {}
+        aps = des.allParameters
+        for i in range(aps.count):
+            mp = adsk.fusion.ModelParameter.cast(aps.item(i))
+            if mp is None or mp.createdBy is None:
+                continue
+            try:
+                entry = {"name": mp.name, "role": mp.role,
+                         "expression": mp.expression}
+                by_feature.setdefault(mp.createdBy.name, []).append(entry)
+            except Exception:
+                continue
+        tl = des.timeline
+        items = []
+        for i in range(tl.count):
+            item = tl.item(i)
+            entry = {"index": i, "name": item.name}
+            try:
+                ent = item.entity
+                if ent is not None:
+                    entry["type"] = ent.objectType.split("::")[-1]
+            except Exception:
+                pass
+            try:
+                if item.isSuppressed:
+                    entry["suppressed"] = True
+            except Exception:
+                pass
+            try:
+                h = _HEALTH_NAMES.get(int(item.healthState), "unknown")
+                if h != "ok":
+                    entry["health"] = h
+                    msg = item.errorOrWarningMessage
+                    if msg:
+                        entry["message"] = msg
+            except Exception:
+                pass
+            if item.name in by_feature:
+                entry["parameters"] = by_feature[item.name]
+            items.append(entry)
+        return {"timelineMarker": tl.markerPosition,
+                "count": tl.count,
+                "timeline": items,
+                "sceneVersion": SCENE_VERSION}
+
+    return run_on_main(work)
+
+
+def cmd_fusion_rollback(params):
+    to = params.get("to", "end")
+
+    def work():
+        des = _design()
+        tl = des.timeline
+        if str(to) == "end":
+            tl.moveToEnd()
+        elif str(to) == "start":
+            tl.markerPosition = 0
+        else:
+            item = _find_feature(des, to)
+            tl.markerPosition = item.index + 1
+        r = {"timelineMarker": tl.markerPosition, "count": tl.count}
+        r.update(_health(des))
+        return r
+
+    return run_on_main(work)
+
+
 def cmd_fusion_selection(params):
     """entityTokens/handles + kinds + bboxes of the user's active selections -
     resolves 'this face/body/feature'."""
@@ -576,6 +1319,13 @@ HANDLERS = {
     "fusion.selection": cmd_fusion_selection,
     "fusion.capture": cmd_fusion_capture,
     "fusion.execute": cmd_fusion_execute,
+    "fusion.params.list": cmd_fusion_params_list,
+    "fusion.params.set": cmd_fusion_params_set,
+    "fusion.sketch.create": cmd_fusion_sketch_create,
+    "fusion.feature.add": cmd_fusion_feature_add,
+    "fusion.feature.edit": cmd_fusion_feature_edit,
+    "fusion.timeline": cmd_fusion_timeline,
+    "fusion.rollback": cmd_fusion_rollback,
     "space.bodies": cmd_space_bodies,
     "space.tessellate": cmd_space_tessellate,
 }

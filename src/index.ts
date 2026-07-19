@@ -145,6 +145,181 @@ server.registerTool(
   async ({ code, timeoutMs }) => relay("fusion.execute", { code }, timeoutMs ?? 120_000),
 );
 
+/* --------------------------- parametric authoring -------------------------- */
+/* Driving parameters is the primary editing verb in Fusion; dimension inputs
+ * everywhere accept plain numbers (doc units), expression strings ("40 mm",
+ * "width/2"), or {param, value} which creates a named user parameter on the
+ * fly so models come out parametric by default. */
+
+const valueSpec = z
+  .union([
+    z.string(),
+    z.number(),
+    z.object({ param: z.string(), value: z.union([z.string(), z.number()]) }),
+  ])
+  .describe(
+    "Number (doc units), expression string ('40 mm', 'width/2'), or {param, value} to create a named user parameter on the fly",
+  );
+
+server.registerTool(
+  "fusion_list_parameters",
+  {
+    annotations: { readOnlyHint: true },
+    description:
+      "List the design's named user parameters (name, expression, value, unit, comment). Set " +
+      "includeModel to also list model parameters (each feature's dimensions, with role + owning " +
+      "feature). Parameters are how a Fusion model is meant to be edited.",
+    inputSchema: {
+      includeModel: z.boolean().optional().describe("Also list per-feature model parameters"),
+    },
+  },
+  async ({ includeModel }) => relay("fusion.params.list", { includeModel }),
+);
+
+server.registerTool(
+  "fusion_set_parameters",
+  {
+    annotations: { idempotentHint: true },
+    description:
+      "Drive parameters by name — THE primary editing verb in Fusion. Batch: set several in one " +
+      "call, one recompute, returns updated values + a timeline health report. Values are unit-aware " +
+      "expressions ('40 mm', 'width/2 + 3 mm'). Unknown names are created as user parameters. " +
+      "Works on user parameters and model parameters (e.g. d1, d2).",
+    inputSchema: {
+      params: z
+        .record(z.string(), z.union([z.string(), z.number()]))
+        .describe("{name: expression} map, e.g. {\"width\": \"60 mm\", \"d3\": \"height/2\"}"),
+    },
+  },
+  async ({ params }) => relay("fusion.params.set", { params }),
+);
+
+server.registerTool(
+  "fusion_create_sketch",
+  {
+    description:
+      "Create a sketch on a plane ('xy'|'xz'|'yz') or planar face (entityToken) with entities, " +
+      "dimensions, and constraints in one call. Entities (2D coords in doc units, each with an " +
+      "optional key for referencing): {type:'line',from,to} {type:'rect',corner1,corner2} " +
+      "{type:'circle',center,radius} {type:'arc',from,through,to} {type:'point',at}. " +
+      "Dimensions: {kind:'distance',of:lineKey|a,b:pointRefs,orientation:'horizontal'|'vertical'|'aligned',value} " +
+      "{kind:'diameter'|'radius',of:key,value} — values accept parameter specs. Constraints: " +
+      "{kind:'horizontal'|'vertical',of} {kind:'coincident'|'concentric'|'equal'|'tangent'|'parallel'|'perpendicular',a,b} " +
+      "{kind:'midpoint',point,line}. Point refs: 'key.start'/'key.end'/'key.center', rect lines 'key.0'..'key.3', 'origin'. " +
+      "Constrain fully — design intent lives in constraints; the result reports fullyConstrained. " +
+      "Returns profile ids ('s1:0') for feature calls.",
+    inputSchema: {
+      plane: z.string().optional().describe("'xy'|'xz'|'yz' (default xy) or a planar face entityToken"),
+      name: z.string().optional().describe("Sketch name in the timeline"),
+      entities: z.array(z.object({ type: z.string(), key: z.string().optional() }).passthrough()),
+      dimensions: z.array(z.object({ kind: z.string() }).passthrough()).optional(),
+      constraints: z.array(z.object({ kind: z.string() }).passthrough()).optional(),
+    },
+  },
+  async (args) => relay("fusion.sketch.create", args),
+);
+
+server.registerTool(
+  "fusion_add_feature",
+  {
+    description:
+      "Append ONE feature to the timeline (stepwise, with a health report after each step). Types: " +
+      "extrude {profile:'s1'|'s1:0', distance, operation:'new'|'join'|'cut'|'intersect'|'newComponent', symmetric?}; " +
+      "revolve {profile, axis:'x'|'y'|'z'|token, angle?, operation}; " +
+      "hole {sketch, points:[pointKeys], diameter, depth?:'through'|value}; " +
+      "fillet {edges:[tokens]|{body,parallelTo:'x'|'y'|'z'}, radius}; chamfer {edges, distance}; " +
+      "shell {body, thickness, removeFaces?:[tokens]}; " +
+      "rectangularPattern {features?:[names], bodies?:[handles], axisOne, countOne, spacingOne, axisTwo?, countTwo?, spacingTwo?}; " +
+      "circularPattern {features?|bodies?, axis, count, totalAngle?}; " +
+      "mirror {features?|bodies?, plane}; combine {target, tools:[handles], operation, keepTools?}. " +
+      "All dimension inputs accept parameter specs — prefer named parameters for anything a designer " +
+      "would want to change later.",
+    inputSchema: {
+      type: z.enum([
+        "extrude", "revolve", "hole", "fillet", "chamfer", "shell",
+        "rectangularPattern", "circularPattern", "mirror", "combine",
+      ]),
+      name: z.string().optional().describe("Feature name in the timeline"),
+      profile: z.string().optional(),
+      distance: valueSpec.optional(),
+      angle: valueSpec.optional(),
+      diameter: valueSpec.optional(),
+      radius: valueSpec.optional(),
+      thickness: valueSpec.optional(),
+      depth: valueSpec.optional(),
+      operation: z.string().optional(),
+      symmetric: z.boolean().optional(),
+      axis: z.string().optional(),
+      sketch: z.string().optional(),
+      points: z.array(z.string()).optional(),
+      edges: z.union([z.array(z.string()), z.object({ body: z.string(), parallelTo: z.string().optional() })]).optional(),
+      body: z.string().optional(),
+      removeFaces: z.array(z.string()).optional(),
+      features: z.array(z.string()).optional(),
+      bodies: z.array(z.string()).optional(),
+      target: z.string().optional(),
+      tools: z.array(z.string()).optional(),
+      keepTools: z.boolean().optional(),
+      axisOne: z.string().optional(),
+      axisTwo: z.string().optional(),
+      countOne: valueSpec.optional(),
+      countTwo: valueSpec.optional(),
+      spacingOne: valueSpec.optional(),
+      spacingTwo: valueSpec.optional(),
+      count: valueSpec.optional(),
+      totalAngle: valueSpec.optional(),
+      plane: z.string().optional(),
+    },
+  },
+  async (args) => relay("fusion.feature.add", args),
+);
+
+server.registerTool(
+  "fusion_edit_feature",
+  {
+    annotations: { idempotentHint: true },
+    description:
+      "Modify an existing timeline feature in place — the Fusion-native 'change it'. set: " +
+      "{roleOrParamName: expression} drives the feature's model parameters (roles like 'Distance', " +
+      "'Radius'; wrong names return the available ones). Also: suppress true/false, name to rename. " +
+      "Recomputes and reports downstream timeline health.",
+    inputSchema: {
+      feature: z.string().describe("Timeline feature name (e.g. 'Extrude1') or index"),
+      set: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
+      suppress: z.boolean().optional(),
+      name: z.string().optional().describe("Rename the feature"),
+    },
+  },
+  async (args) => relay("fusion.feature.edit", args),
+);
+
+server.registerTool(
+  "fusion_timeline",
+  {
+    annotations: { readOnlyHint: true },
+    description:
+      "Full timeline introspection: features in order with type, health (errors/warnings + " +
+      "messages), suppression, each feature's model parameters (name, role, expression), and the " +
+      "rollback marker position. The design IS this timeline — use it to understand or debug a model.",
+    inputSchema: {},
+  },
+  async () => relay("fusion.timeline"),
+);
+
+server.registerTool(
+  "fusion_rollback",
+  {
+    description:
+      "Move the timeline rollback marker: to='end', 'start', a feature name, or index (marker lands " +
+      "AFTER that feature). Features after the marker are temporarily rolled back — use for " +
+      "mid-history edits, then roll to 'end'.",
+    inputSchema: {
+      to: z.string().describe("'end' | 'start' | feature name | index"),
+    },
+  },
+  async ({ to }) => relay("fusion.rollback", { to }),
+);
+
 /* ------------------------------ spatial tools ----------------------------- */
 
 const idsParam = z
