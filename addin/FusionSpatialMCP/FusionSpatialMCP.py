@@ -57,8 +57,9 @@ _listener = None
 # caches meshes/BVH keyed by (id, sceneVersion).
 SCENE_VERSION = 1
 
-# Mutating methods arrive with the Phase-B authoring surface (F4).
-MUTATING_METHODS = set()
+# Mutating methods bump SCENE_VERSION; the rest of the Phase-B authoring
+# surface joins this set at F4.
+MUTATING_METHODS = set(["fusion.execute"])
 
 
 # --------------------------------------------------------------------------- #
@@ -446,9 +447,35 @@ def cmd_space_tessellate(params):
     return run_on_main(work)
 
 
+def cmd_fusion_execute(params):
+    """Escape hatch: run Python on the Fusion main thread. Globals: adsk,
+    app, ui. Assign to a variable named `result` to return a value; stdout
+    is captured."""
+    code = params.get("code")
+    if not code:
+        raise RuntimeError("A 'code' string is required.")
+
+    def work():
+        import io
+        import contextlib
+        env = {"adsk": adsk, "app": _app, "ui": _ui}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exec(code, env)
+        result = env.get("result")
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError):
+            result = repr(result)
+        return {"result": result, "stdout": buf.getvalue()[-8000:]}
+
+    return run_on_main(work)
+
+
 HANDLERS = {
     # "ping" is answered on the socket thread (dispatcher), no API needed.
     "fusion.document": cmd_fusion_document,
+    "fusion.execute": cmd_fusion_execute,
     "space.bodies": cmd_space_bodies,
     "space.tessellate": cmd_space_tessellate,
 }
