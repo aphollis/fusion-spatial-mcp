@@ -309,6 +309,7 @@ server.registerTool(
 server.registerTool(
   "fusion_rollback",
   {
+    annotations: { idempotentHint: true },
     description:
       "Move the timeline rollback marker: to='end', 'start', a feature name, or index (marker lands " +
       "AFTER that feature). Features after the marker are temporarily rolled back — use for " +
