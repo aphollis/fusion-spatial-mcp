@@ -20,10 +20,9 @@ Hard rules:
   design's default display unit at the adapter); documents are commonly Y-up
   (report the actual axis); use entityToken as body id; API calls only on the
   main thread via CustomEvent marshaling; listener binds WITHOUT SO_REUSEADDR.
-- Tooling on this machine: portable git at C:\Users\nerfd\tools\mingit\cmd,
-  gh CLI at C:\Users\nerfd\tools\ghcli\bin (account: aphollis, commits need
-  the noreply email — see git config), Node 22, no system Python (py_compile
-  via C:\Users\nerfd\.rhinocode\py39-rh8\python.exe), winget hangs on UAC.
+- This repo is public — no machine-specific paths or private details in
+  committed files. Machine tooling notes live in session memory, not here.
+  Validate add-in Python offline with any CPython 3.9+ `py_compile`.
 - Fusion 360 is installed (webdeploy production). Dev add-ins folder:
   %APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns\ (user has prior add-in
   experience — "Sheeter" add-in and the FusionRhinoBar project).
