@@ -3,7 +3,7 @@
 // Works for any platform adapter that speaks the protocol (Rhino today,
 // Fusion later). Read-only: makes no mutating calls.
 //
-//   node tools/validate-protocol.mjs           (listener on 127.0.0.1:8765)
+//   node tools/validate-protocol.mjs           (listener on 127.0.0.1:8767)
 //   RHINO_MCP_PORT=9999 node tools/validate-protocol.mjs
 
 import net from "node:net";
@@ -14,7 +14,8 @@ import Ajv from "ajv";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONTRACTS = path.join(__dirname, "..", "contracts");
-const PORT = Number(process.env.RHINO_MCP_PORT ?? 8765);
+// Default = the Fusion add-in's port (this repo). Env override still works.
+const PORT = Number(process.env.RHINO_MCP_PORT ?? 8767);
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 const validateBodies = ajv.compile(

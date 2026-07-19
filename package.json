@@ -1,0 +1,24 @@
+{
+  "name": "fusion-spatial-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Autodesk Fusion 360: Fusion-native parametric authoring + spatial reasoning for AI agents",
+  "type": "module",
+  "bin": {
+    "fusion-spatial-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "conformance": "node tools/validate-protocol.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.0",
+    "spatial-core": "file:../rhino-gh-mcp/spatial",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "ajv": "^8.20.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "041f11da-bf3a-4eba-b03c-964443f06136",
+    "author": "aphollis",
+    "description": {
+        "": "TCP JSON-lines listener for the fusion-spatial-mcp MCP server (port 8767)"
+    },
+    "version": "0.1.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
