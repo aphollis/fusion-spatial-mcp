@@ -189,10 +189,30 @@ def _iter_body_entries(des):
             yield occ.bRepBodies.item(j), occ
 
 
+# Short stable handles: entityTokens are ~250-char strings - hostile as
+# agent-facing ids. space.bodies assigns "b1", "b2", ... per token and every
+# resolver accepts handle, raw token, or body name. Handles persist for the
+# add-in session; sceneVersion invalidation covers mutations as usual.
+_BODY_HANDLES = {}   # entityToken -> handle
+_HANDLE_TOKENS = {}  # handle -> entityToken
+_next_handle = [1]
+
+
+def _handle_for(token):
+    h = _BODY_HANDLES.get(token)
+    if h is None:
+        h = "b%d" % _next_handle[0]
+        _next_handle[0] += 1
+        _BODY_HANDLES[token] = h
+        _HANDLE_TOKENS[h] = token
+    return h
+
+
 def _find_body(des, id_str):
-    """Resolve a body by entityToken (preferred) or name; defensive about
+    """Resolve a body by short handle, entityToken, or name; defensive about
     stale tokens after destructive edits."""
     s = str(id_str)
+    s = _HANDLE_TOKENS.get(s, s)
     try:
         ents = des.findEntityByToken(s)
     except Exception:
@@ -300,13 +320,20 @@ def cmd_space_bodies(params):
         unit, f = _unit_factor(des)
         bodies = []
         if scope != "gh":
-            wanted = set(str(i) for i in ids) if ids else None
+            wanted = None
+            if ids:
+                wanted = set()
+                for i in ids:
+                    s = str(i)
+                    wanted.add(_HANDLE_TOKENS.get(s, s))
+                    wanted.add(s)
             for b, occ in _iter_body_entries(des):
                 try:
                     token = b.entityToken
                     name = b.name
+                    handle = _handle_for(token)
                     if wanted is not None and token not in wanted \
-                            and name not in wanted:
+                            and name not in wanted and handle not in wanted:
                         continue
                     bb = b.boundingBox  # world-aligned (proxies: world space)
                     solid = bool(b.isSolid)
@@ -330,7 +357,7 @@ def cmd_space_bodies(params):
                     else:
                         where = b.parentComponent.name
                     bodies.append({
-                        "id": token,
+                        "id": handle,
                         "name": name or None,
                         "source": "doc",
                         "kind": "solid" if solid else "surface",
@@ -447,6 +474,77 @@ def cmd_space_tessellate(params):
     return run_on_main(work)
 
 
+def cmd_fusion_selection(params):
+    """entityTokens/handles + kinds + bboxes of the user's active selections -
+    resolves 'this face/body/feature'."""
+    def work():
+        des = _design()
+        unit, f = _unit_factor(des)
+        items = []
+        sels = _ui.activeSelections
+        for i in range(sels.count):
+            try:
+                ent = sels.item(i).entity
+                entry = {"kind": ent.objectType.split("::")[-1]}
+                try:
+                    entry["name"] = ent.name
+                except Exception:
+                    pass
+                try:
+                    token = ent.entityToken
+                    entry["id"] = _handle_for(token) \
+                        if adsk.fusion.BRepBody.cast(ent) else token
+                except Exception:
+                    pass
+                try:
+                    bb = ent.boundingBox
+                    if bb is not None:
+                        entry["bbox"] = _bbox_dict(bb, f)
+                except Exception:
+                    pass
+                # owning body for faces/edges/vertices
+                try:
+                    body = ent.body
+                    if body is not None:
+                        entry["body"] = _handle_for(body.entityToken)
+                        entry["bodyName"] = body.name
+                except Exception:
+                    pass
+                items.append(entry)
+            except Exception:
+                continue
+        return {"count": len(items), "units": unit, "items": items}
+
+    return run_on_main(work)
+
+
+def cmd_fusion_capture(params):
+    """Viewport screenshot -> PNG (base64)."""
+    width = int(params.get("width") or 800)
+    height = int(params.get("height") or 600)
+
+    def work():
+        import os
+        import tempfile
+        vp = _app.activeViewport
+        if vp is None:
+            raise RuntimeError("No active viewport.")
+        path = os.path.join(tempfile.gettempdir(),
+                            "FusionSpatialMCP_capture.png")
+        if not vp.saveAsImageFile(path, width, height):
+            raise RuntimeError("Viewport capture failed.")
+        with open(path, "rb") as fh:
+            data = fh.read()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return {"png_b64": base64.b64encode(data).decode("ascii"),
+                "width": width, "height": height}
+
+    return run_on_main(work)
+
+
 def cmd_fusion_execute(params):
     """Escape hatch: run Python on the Fusion main thread. Globals: adsk,
     app, ui. Assign to a variable named `result` to return a value; stdout
@@ -475,6 +573,8 @@ def cmd_fusion_execute(params):
 HANDLERS = {
     # "ping" is answered on the socket thread (dispatcher), no API needed.
     "fusion.document": cmd_fusion_document,
+    "fusion.selection": cmd_fusion_selection,
+    "fusion.capture": cmd_fusion_capture,
     "fusion.execute": cmd_fusion_execute,
     "space.bodies": cmd_space_bodies,
     "space.tessellate": cmd_space_tessellate,
