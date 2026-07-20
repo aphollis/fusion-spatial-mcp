@@ -145,6 +145,66 @@ server.registerTool(
   async ({ code, timeoutMs }) => relay("fusion.execute", { code }, timeoutMs ?? 120_000),
 );
 
+/* ------------------------- sub-body geometry queries ----------------------- */
+/* Analytic B-Rep granularity the tessellation-based space_* tools don't have.
+ * Patterns adapted from Fusion-Essentials (MIT/Apache-2.0). */
+
+server.registerTool(
+  "fusion_find_geometry",
+  {
+    annotations: { readOnlyHint: true },
+    description:
+      "Scan bodies' faces/edges/vertices ANALYTICALLY and return handles (f1/e2/v3) with kind, " +
+      "world position, and shape data: cylinder radius+axis, face area+normal, edge length/radius, " +
+      "line direction. THE way to get references for fusion_add_feature (fillet/chamfer edges, " +
+      "sketch plane faces, shell removeFaces, revolve axes) and fusion_measure_relation. Narrow with " +
+      "kind, radius (5% tol), nearestTo — e.g. kind='cylinder_face', radius=3 finds the 3mm holes. " +
+      "Handles self-heal across recomputes (re-found by kind+position); after topology-changing " +
+      "edits, re-run to be safe.",
+    inputSchema: {
+      target: z.string().optional().describe("Body handle or name; omit = all bodies"),
+      kind: z
+        .enum([
+          "cylinder_face", "planar_face", "cone_face", "sphere_face", "torus_face",
+          "circular_edge", "line_edge", "arc_edge", "vertex",
+        ])
+        .optional()
+        .describe("Geometry kind filter (omit = faces + edges)"),
+      radius: z.number().positive().optional().describe("Keep only round geometry with this radius (doc units)"),
+      nearestTo: z.array(z.number()).length(3).optional().describe("[x,y,z] — sort matches by distance to this point"),
+      maxResults: z.number().int().min(1).max(100).optional().describe("Cap (default 20)"),
+    },
+  },
+  async (args) => relay("fusion.find_geometry", args),
+);
+
+server.registerTool(
+  "fusion_measure_relation",
+  {
+    annotations: { readOnlyHint: true },
+    description:
+      "Exact kernel measurement or pass/fail verdict between two entities (handles from " +
+      "fusion_find_geometry / fusion_get_selection, or body handles/names). relation='distance' " +
+      "(min gap + closest points) or 'angle' return measurements; 'parallel'/'perpendicular' " +
+      "(directions within toleranceDeg), 'coaxial' (parallel AND axis lines coincide — angle 0 " +
+      "alone is only parallel!), 'flush' (planar faces coplanar), 'concentric' (circular entities' " +
+      "centers coincide), 'clearance' (gap >= tolerance), 'touching' (gap <= tolerance) return " +
+      "verdicts WITH the measured evidence. Use for design-intent checks: is this hole coaxial " +
+      "with that boss?",
+    inputSchema: {
+      a: z.string().describe("First entity: f#/e# handle, body handle/name, or entityToken"),
+      b: z.string().describe("Second entity"),
+      relation: z.enum([
+        "distance", "angle", "parallel", "perpendicular", "coaxial",
+        "concentric", "flush", "clearance", "touching",
+      ]),
+      tolerance: z.number().positive().optional().describe("Linear tolerance in doc units (default 0.1 mm equivalent)"),
+      toleranceDeg: z.number().positive().optional().describe("Angular tolerance in degrees (default 0.5)"),
+    },
+  },
+  async (args) => relay("fusion.relation", args),
+);
+
 /* --------------------------- parametric authoring -------------------------- */
 /* Driving parameters is the primary editing verb in Fusion; dimension inputs
  * everywhere accept plain numbers (doc units), expression strings ("40 mm",
@@ -227,7 +287,7 @@ server.registerTool(
       "extrude {profile:'s1'|'s1:0', distance, operation:'new'|'join'|'cut'|'intersect'|'newComponent', symmetric?}; " +
       "revolve {profile, axis:'x'|'y'|'z'|token, angle?, operation}; " +
       "hole {sketch, points:[pointKeys], diameter, depth?:'through'|value}; " +
-      "fillet {edges:[tokens]|{body,parallelTo:'x'|'y'|'z'}, radius}; chamfer {edges, distance}; " +
+      "fillet {edges:[e# handles from fusion_find_geometry]|{body,parallelTo:'x'|'y'|'z'}, radius}; chamfer {edges, distance}; " +
       "shell {body, thickness, removeFaces?:[tokens]}; " +
       "rectangularPattern {features?:[names], bodies?:[handles], axisOne, countOne, spacingOne, axisTwo?, countTwo?, spacingTwo?}; " +
       "circularPattern {features?|bodies?, axis, count, totalAngle?}; " +

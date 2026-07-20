@@ -239,6 +239,435 @@ def _find_body(des, id_str):
 
 
 # --------------------------------------------------------------------------- #
+# sub-body entities: analytic scan + self-healing handles
+# Patterns adapted from Fusion-Essentials (Philip-Mestenhauser/
+# Fusion-Essentials, MIT/Apache-2.0): find_geometry's analytic face/edge scan
+# and its composite self-healing handles (token + kind/position locator, so a
+# stale token re-resolves to the same geometry instead of erroring).
+# --------------------------------------------------------------------------- #
+
+_ENTITY_INFO = {}      # handle ("f1"/"e2"/"v3") -> {token, kind, pos(cm), body}
+_ENTITY_BY_TOKEN = {}  # entityToken -> handle
+_next_entity = {"f": [1], "e": [1], "v": [1]}
+
+
+def _face_kind(face):
+    ST = adsk.core.SurfaceTypes
+    try:
+        st = face.geometry.surfaceType
+    except Exception:
+        return "face"
+    return {ST.CylinderSurfaceType: "cylinder_face",
+            ST.PlaneSurfaceType: "planar_face",
+            ST.ConeSurfaceType: "cone_face",
+            ST.SphereSurfaceType: "sphere_face",
+            ST.TorusSurfaceType: "torus_face",
+            ST.NurbsSurfaceType: "nurbs_face"}.get(st, "face")
+
+
+def _edge_kind(edge):
+    CT = adsk.core.Curve3DTypes
+    try:
+        ct = edge.geometry.curveType
+    except Exception:
+        return "edge"
+    return {CT.Circle3DCurveType: "circular_edge",
+            CT.Line3DCurveType: "line_edge",
+            CT.Arc3DCurveType: "arc_edge"}.get(ct, "edge")
+
+
+def _entity_kind_pos(ent):
+    """(kind, locator position in cm) for a face/edge/vertex, or (None, None).
+    Circular edges use the circle CENTER as locator (stable across re-finds);
+    other edges use pointOnEdge; faces use the centroid."""
+    face = adsk.fusion.BRepFace.cast(ent)
+    if face is not None:
+        c = face.centroid
+        return _face_kind(face), (c.x, c.y, c.z)
+    edge = adsk.fusion.BRepEdge.cast(ent)
+    if edge is not None:
+        kind = _edge_kind(edge)
+        if kind in ("circular_edge", "arc_edge"):
+            c = edge.geometry.center
+        else:
+            c = edge.pointOnEdge
+        return kind, (c.x, c.y, c.z)
+    vtx = adsk.fusion.BRepVertex.cast(ent)
+    if vtx is not None:
+        g = vtx.geometry
+        return "vertex", (g.x, g.y, g.z)
+    return None, None
+
+
+def _register_entity(ent, kind, pos_cm, body_handle):
+    token = ent.entityToken
+    h = _ENTITY_BY_TOKEN.get(token)
+    if h is None:
+        prefix = "f" if "face" in kind else ("e" if "edge" in kind else "v")
+        n = _next_entity[prefix]
+        h = "%s%d" % (prefix, n[0])
+        n[0] += 1
+        _ENTITY_BY_TOKEN[token] = h
+    _ENTITY_INFO[h] = {"token": token, "kind": kind, "pos": pos_cm,
+                       "body": body_handle}
+    return h
+
+
+def _cast_subentity(e):
+    for t in (adsk.fusion.BRepFace, adsk.fusion.BRepEdge,
+              adsk.fusion.BRepVertex):
+        c = t.cast(e)
+        if c is not None:
+            return c
+    return None
+
+
+def _resolve_entity(des, id_str):
+    """Resolve a face/edge/vertex by handle (f#/e#/v#) or raw entityToken.
+    The kind+position locator is AUTHORITATIVE, the token a fast path:
+    verified live that findEntityByToken can succeed yet return a DIFFERENT
+    face of the same body (direct-modeling docs especially), so a token
+    result is only trusted when it sits exactly on the recorded locator;
+    anything else re-finds the same-kind geometry nearest the recorded
+    position on the recorded body and updates the registry."""
+    s = str(id_str)
+    info = _ENTITY_INFO.get(s)
+    token = info["token"] if info else s
+    try:
+        ents = des.findEntityByToken(token)
+    except Exception:
+        ents = None
+    for e in (ents or []):
+        c = _cast_subentity(e)
+        if c is None:
+            continue
+        if info is None:
+            return c
+        k2, pos2 = _entity_kind_pos(c)
+        if k2 == info["kind"] and pos2 is not None:
+            px, py, pz = info["pos"]
+            d2 = ((pos2[0] - px) ** 2 + (pos2[1] - py) ** 2
+                  + (pos2[2] - pz) ** 2)
+            if d2 <= 1e-10:
+                return c
+        break  # token resolved but does not match the locator - re-find
+    if info is None:
+        raise RuntimeError(
+            "'%s' is not a known entity handle or live entityToken. Run "
+            "fusion_find_geometry for fresh handles." % s[:48])
+    body = _find_body(des, info["body"])
+    kind = info["kind"]
+    px, py, pz = info["pos"]
+    if "face" in kind:
+        pool = body.faces
+    elif "edge" in kind:
+        pool = body.edges
+    else:
+        pool = body.vertices
+    best = None
+    best_d = None
+    best_pos = None
+    for i in range(pool.count):
+        cand = pool.item(i)
+        k2, pos2 = _entity_kind_pos(cand)
+        if k2 != kind:
+            continue
+        d = ((pos2[0] - px) ** 2 + (pos2[1] - py) ** 2
+             + (pos2[2] - pz) ** 2) ** 0.5
+        if best_d is None or d < best_d:
+            best, best_d, best_pos = cand, d, pos2
+    if best is None:
+        raise RuntimeError(
+            "Handle '%s' is stale and no %s remains on body '%s' to re-find. "
+            "Run fusion_find_geometry again." % (s, kind, info["body"]))
+    info["token"] = best.entityToken
+    info["pos"] = best_pos
+    _ENTITY_BY_TOKEN[best.entityToken] = s
+    return best
+
+
+def _face_normal_at(face, point):
+    try:
+        okflag, nrm = face.evaluator.getNormalAtPoint(point)
+        if okflag and nrm is not None:
+            return [_round4(nrm.x), _round4(nrm.y), _round4(nrm.z)]
+    except Exception:
+        pass
+    return None
+
+
+_FACE_KIND_NAMES = ("cylinder_face", "planar_face", "cone_face",
+                    "sphere_face", "torus_face")
+_EDGE_KIND_NAMES = ("circular_edge", "line_edge", "arc_edge")
+
+
+def cmd_fusion_find_geometry(params):
+    target = params.get("target") or ""
+    kind = str(params.get("kind") or "").strip()
+    radius = params.get("radius")
+    nearest = params.get("nearestTo")
+    max_results = int(params.get("maxResults") or 20)
+
+    def work():
+        des = _design()
+        unit, f = _unit_factor(des)
+        if target:
+            bodies = [_find_body(des, target)]
+        else:
+            bodies = [b for b, _occ in _iter_body_entries(des)]
+        want_faces = (not kind) or kind in _FACE_KIND_NAMES
+        want_edges = (not kind) or kind in _EDGE_KIND_NAMES
+        want_verts = kind == "vertex"
+        if kind and not (want_faces or want_edges or want_verts):
+            raise RuntimeError(
+                "Unknown kind '%s' (%s|vertex)." %
+                (kind, "|".join(_FACE_KIND_NAMES + _EDGE_KIND_NAMES)))
+
+        matches = []
+        for b in bodies:
+            bh = _handle_for(b.entityToken)
+            if want_faces:
+                for i in range(b.faces.count):
+                    face = b.faces.item(i)
+                    k, pos = _entity_kind_pos(face)
+                    if kind and k != kind:
+                        continue
+                    rec = {"id": _register_entity(face, k, pos, bh),
+                           "kind": k, "body": bh,
+                           "position": _pt(pos[0], pos[1], pos[2], f)}
+                    try:
+                        rec["area"] = _round4(face.area * f ** 2)
+                    except Exception:
+                        pass
+                    c = face.centroid
+                    nrm = _face_normal_at(face, c)
+                    if nrm is not None:
+                        rec["normal"] = nrm
+                    if k in ("cylinder_face", "cone_face"):
+                        try:
+                            g = face.geometry
+                            rec["radius"] = _round4(g.radius * f)
+                            ax = g.axis
+                            rec["axis"] = [_round4(ax.x), _round4(ax.y),
+                                           _round4(ax.z)]
+                        except Exception:
+                            pass
+                    matches.append(rec)
+            if want_edges:
+                for i in range(b.edges.count):
+                    edge = b.edges.item(i)
+                    k, pos = _entity_kind_pos(edge)
+                    if kind and k != kind:
+                        continue
+                    rec = {"id": _register_entity(edge, k, pos, bh),
+                           "kind": k, "body": bh,
+                           "position": _pt(pos[0], pos[1], pos[2], f)}
+                    try:
+                        rec["length"] = _round4(edge.length * f)
+                    except Exception:
+                        pass
+                    if k in ("circular_edge", "arc_edge"):
+                        try:
+                            rec["radius"] = _round4(edge.geometry.radius * f)
+                        except Exception:
+                            pass
+                    elif k == "line_edge":
+                        try:
+                            g = edge.geometry
+                            dx = g.endPoint.x - g.startPoint.x
+                            dy = g.endPoint.y - g.startPoint.y
+                            dz = g.endPoint.z - g.startPoint.z
+                            n = (dx * dx + dy * dy + dz * dz) ** 0.5
+                            if n > 1e-12:
+                                rec["direction"] = [_round4(dx / n),
+                                                    _round4(dy / n),
+                                                    _round4(dz / n)]
+                        except Exception:
+                            pass
+                    matches.append(rec)
+            if want_verts:
+                for i in range(b.vertices.count):
+                    vtx = b.vertices.item(i)
+                    k, pos = _entity_kind_pos(vtx)
+                    matches.append({"id": _register_entity(vtx, k, pos, bh),
+                                    "kind": k, "body": bh,
+                                    "position": _pt(pos[0], pos[1], pos[2], f)})
+
+        if radius is not None:
+            r = float(radius)
+            matches = [m for m in matches if "radius" in m
+                       and abs(m["radius"] - r) <= max(0.05 * r, 1e-6)]
+        if isinstance(nearest, (list, tuple)) and len(nearest) == 3:
+            npt = [float(v) for v in nearest]
+            matches = [m for m in matches if m.get("position")]
+            matches.sort(key=lambda m: sum(
+                (m["position"][i] - npt[i]) ** 2 for i in range(3)))
+
+        total = len(matches)
+        matches = matches[:max(1, max_results)]
+        return {"matchCount": total, "returned": len(matches),
+                "units": unit, "matches": matches}
+
+    return run_on_main(work)
+
+
+_RELATIONS = ("distance", "angle", "parallel", "perpendicular", "coaxial",
+              "concentric", "flush", "clearance", "touching")
+
+
+def _resolve_rel_target(des, s):
+    """A relation operand: entity handle/token, or a body handle/name."""
+    s = str(s)
+    if s in _ENTITY_INFO:
+        return _resolve_entity(des, s)
+    if s in _HANDLE_TOKENS:
+        return _find_body(des, s)
+    try:
+        return _resolve_entity(des, s)
+    except Exception:
+        return _find_body(des, s)
+
+
+def _direction_of(ent):
+    """(unit direction Vector3D, origin Point3D, label) of an entity's axis/
+    normal, or raises. Planar face -> normal; cylinder/cone -> axis; line
+    edge -> direction; circular/arc edge -> circle normal at its center."""
+    face = adsk.fusion.BRepFace.cast(ent)
+    if face is not None:
+        g = face.geometry
+        pl = adsk.core.Plane.cast(g)
+        if pl is not None:
+            d = pl.normal.copy()
+            d.normalize()
+            return d, pl.origin, "planar normal"
+        for cls, label in ((adsk.core.Cylinder, "cylinder axis"),
+                           (adsk.core.Cone, "cone axis")):
+            c = cls.cast(g)
+            if c is not None:
+                d = c.axis.copy()
+                d.normalize()
+                return d, c.origin, label
+    edge = adsk.fusion.BRepEdge.cast(ent)
+    if edge is not None:
+        g = edge.geometry
+        ln = adsk.core.Line3D.cast(g)
+        if ln is not None:
+            d = ln.startPoint.vectorTo(ln.endPoint)
+            d.normalize()
+            return d, ln.startPoint, "edge direction"
+        for cls in (adsk.core.Circle3D, adsk.core.Arc3D):
+            c = cls.cast(g)
+            if c is not None:
+                d = c.normal.copy()
+                d.normalize()
+                return d, c.center, "circle normal"
+    raise RuntimeError(
+        "Entity has no defined direction (need a planar/cylindrical/conical "
+        "face, a line edge, or a circular edge).")
+
+
+def _center_of(ent):
+    """Center point of a circular entity, or raises."""
+    edge = adsk.fusion.BRepEdge.cast(ent)
+    if edge is not None:
+        for cls in (adsk.core.Circle3D, adsk.core.Arc3D):
+            c = cls.cast(edge.geometry)
+            if c is not None:
+                return c.center
+    face = adsk.fusion.BRepFace.cast(ent)
+    if face is not None:
+        for cls in (adsk.core.Sphere, adsk.core.Cylinder):
+            c = cls.cast(face.geometry)
+            if c is not None:
+                return c.origin
+    raise RuntimeError(
+        "concentric needs circular entities (circular/arc edge, sphere, or "
+        "cylinder face). For two cylinders, coaxial is usually the right "
+        "question.")
+
+
+def cmd_fusion_relation(params):
+    # Verdict semantics adapted from Fusion-Essentials' model_measure_relation
+    # (MIT/Apache-2.0), incl. its coaxial trap: two axes at angle 0 are only
+    # PARALLEL - coaxial also needs the axis LINES to coincide.
+    import math as _math
+    a_s = params.get("a")
+    b_s = params.get("b")
+    relation = str(params.get("relation") or "").strip()
+    if relation not in _RELATIONS:
+        raise RuntimeError("Unknown relation '%s' (%s)."
+                           % (relation, "|".join(_RELATIONS)))
+    if not a_s or not b_s:
+        raise RuntimeError("Both 'a' and 'b' are required.")
+    tol_in = params.get("tolerance")
+    tol_deg = float(params.get("toleranceDeg") or 0.5)
+
+    def work():
+        des = _design()
+        unit, f = _unit_factor(des)
+        # default linear tolerance 0.01 cm (0.1 mm) - a fixed physical size
+        tol_cm = (float(tol_in) / f) if tol_in is not None else 0.01
+        ea = _resolve_rel_target(des, a_s)
+        eb = _resolve_rel_target(des, b_s)
+        measured = {}
+        passed = None
+
+        if relation in ("distance", "clearance", "touching"):
+            mr = _app.measureManager.measureMinimumDistance(ea, eb)
+            d_cm = mr.value
+            measured["distance"] = _round4(d_cm * f)
+            p1, p2 = mr.positionOne, mr.positionTwo
+            measured["closestPointA"] = _pt(p1.x, p1.y, p1.z, f)
+            measured["closestPointB"] = _pt(p2.x, p2.y, p2.z, f)
+            if relation == "clearance":
+                passed = d_cm >= tol_cm
+            elif relation == "touching":
+                passed = d_cm <= tol_cm
+        elif relation == "angle":
+            mr = _app.measureManager.measureAngle(ea, eb)
+            measured["angleDeg"] = _round4(_math.degrees(mr.value))
+        else:
+            da, oa, la = _direction_of(ea)
+            db, ob, lb = _direction_of(eb)
+            dot = abs(da.x * db.x + da.y * db.y + da.z * db.z)
+            ang = _math.degrees(_math.acos(max(-1.0, min(1.0, dot))))
+            measured["angleDeg"] = _round4(ang)
+            measured["directions"] = [la, lb]
+            if relation == "parallel":
+                passed = ang <= tol_deg
+            elif relation == "perpendicular":
+                passed = abs(ang - 90.0) <= tol_deg
+            elif relation == "coaxial":
+                v = oa.vectorTo(ob)
+                along = v.x * da.x + v.y * da.y + v.z * da.z
+                off = adsk.core.Vector3D.create(v.x - along * da.x,
+                                                v.y - along * da.y,
+                                                v.z - along * da.z)
+                measured["axisOffset"] = _round4(off.length * f)
+                passed = ang <= tol_deg and off.length <= tol_cm
+            elif relation == "flush":
+                v = oa.vectorTo(ob)
+                plane_off = abs(v.x * da.x + v.y * da.y + v.z * da.z)
+                measured["planeOffset"] = _round4(plane_off * f)
+                passed = ang <= tol_deg and plane_off <= tol_cm
+            elif relation == "concentric":
+                ca, cb = _center_of(ea), _center_of(eb)
+                dist = ca.distanceTo(cb)
+                measured["centerDistance"] = _round4(dist * f)
+                passed = dist <= tol_cm
+
+        r = {"relation": relation, "a": str(a_s), "b": str(b_s),
+             "measured": measured, "units": unit}
+        if passed is not None:
+            r["passed"] = bool(passed)
+            r["tolerance"] = _round4(tol_cm * f)
+            r["toleranceDeg"] = tol_deg
+        return r
+
+    return run_on_main(work)
+
+
+# --------------------------------------------------------------------------- #
 # command handlers
 # --------------------------------------------------------------------------- #
 
@@ -517,17 +946,21 @@ def _plane_of(des, spec):
     s = str(spec or "xy").lower()
     if s in named:
         return named[s]
-    ents = des.findEntityByToken(str(spec))
-    for e in (ents or []):
-        face = adsk.fusion.BRepFace.cast(e)
+    try:
+        ent = _resolve_entity(des, spec)
+        face = adsk.fusion.BRepFace.cast(ent)
         if face is not None:
             return face
+    except Exception:
+        pass
+    ents = des.findEntityByToken(str(spec))
+    for e in (ents or []):
         cp = adsk.fusion.ConstructionPlane.cast(e)
         if cp is not None:
             return cp
     raise RuntimeError(
-        "Unknown sketch plane '%s' (use 'xy'/'xz'/'yz' or a planar face "
-        "entityToken from fusion_get_selection)." % spec)
+        "Unknown sketch plane '%s' (use 'xy'/'xz'/'yz', or a planar-face "
+        "handle from fusion_find_geometry / fusion_get_selection)." % spec)
 
 
 def _axis_of(des, spec):
@@ -538,6 +971,13 @@ def _axis_of(des, spec):
     s = str(spec).lower()
     if s in named:
         return named[s]
+    try:
+        ent = _resolve_entity(des, spec)
+        edge = adsk.fusion.BRepEdge.cast(ent)
+        if edge is not None:
+            return edge
+    except Exception:
+        pass
     ents = des.findEntityByToken(str(spec))
     for e in (ents or []):
         for t in (adsk.fusion.ConstructionAxis, adsk.fusion.SketchLine,
@@ -545,8 +985,9 @@ def _axis_of(des, spec):
             c = t.cast(e)
             if c is not None:
                 return c
-    raise RuntimeError("Unknown axis '%s' (use 'x'/'y'/'z' or an entityToken "
-                       "of an edge/sketch line/construction axis)." % spec)
+    raise RuntimeError("Unknown axis '%s' (use 'x'/'y'/'z', an edge handle "
+                       "from fusion_find_geometry, or an entityToken of a "
+                       "sketch line/construction axis)." % spec)
 
 
 def _find_sketch(des, handle):
@@ -930,15 +1371,14 @@ def _edges_of(des, spec):
     {"body": handle, "parallelTo": "x|y|z"} / {"body": handle} (all edges)."""
     if isinstance(spec, list):
         out = []
-        for token in spec:
-            ents = des.findEntityByToken(str(token))
-            for e in (ents or []):
-                edge = adsk.fusion.BRepEdge.cast(e)
-                if edge is not None:
-                    out.append(edge)
-                    break
+        for ref in spec:
+            ent = _resolve_entity(des, ref)
+            edge = adsk.fusion.BRepEdge.cast(ent)
+            if edge is None:
+                raise RuntimeError("'%s' is not an edge." % str(ref)[:48])
+            out.append(edge)
         if not out:
-            raise RuntimeError("No edges resolved from the given tokens.")
+            raise RuntimeError("No edges resolved from the given references.")
         return out
     if isinstance(spec, dict) and spec.get("body"):
         body = _find_body(des, spec["body"])
@@ -1055,12 +1495,11 @@ def cmd_fusion_feature_add(params):
         elif ftype == "shell":
             body = _find_body(des, params.get("body"))
             faces = []
-            for token in (params.get("removeFaces") or []):
-                for e in (des.findEntityByToken(str(token)) or []):
-                    fc = adsk.fusion.BRepFace.cast(e)
-                    if fc is not None:
-                        faces.append(fc)
-                        break
+            for ref in (params.get("removeFaces") or []):
+                fc = adsk.fusion.BRepFace.cast(_resolve_entity(des, ref))
+                if fc is None:
+                    raise RuntimeError("'%s' is not a face." % str(ref)[:48])
+                faces.append(fc)
             inp = feats.shellFeatures.createInput(
                 _collection(faces if faces else [body]), False)
             inp.insideThickness = _vi(params.get("thickness"), des)
@@ -1257,9 +1696,20 @@ def cmd_fusion_selection(params):
                 except Exception:
                     pass
                 try:
-                    token = ent.entityToken
-                    entry["id"] = _handle_for(token) \
-                        if adsk.fusion.BRepBody.cast(ent) else token
+                    if adsk.fusion.BRepBody.cast(ent) is not None:
+                        entry["id"] = _handle_for(ent.entityToken)
+                    else:
+                        k, pos = _entity_kind_pos(ent)
+                        if k is not None:
+                            owner = None
+                            try:
+                                owner = _handle_for(ent.body.entityToken)
+                            except Exception:
+                                pass
+                            entry["id"] = _register_entity(ent, k, pos, owner)
+                            entry["kind"] = k
+                        else:
+                            entry["id"] = ent.entityToken
                 except Exception:
                     pass
                 try:
@@ -1342,6 +1792,8 @@ HANDLERS = {
     "fusion.selection": cmd_fusion_selection,
     "fusion.capture": cmd_fusion_capture,
     "fusion.execute": cmd_fusion_execute,
+    "fusion.find_geometry": cmd_fusion_find_geometry,
+    "fusion.relation": cmd_fusion_relation,
     "fusion.params.list": cmd_fusion_params_list,
     "fusion.params.set": cmd_fusion_params_set,
     "fusion.sketch.create": cmd_fusion_sketch_create,

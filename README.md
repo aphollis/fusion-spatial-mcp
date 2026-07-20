@@ -67,6 +67,13 @@ numerically by the spatial tools.
   wall thickness): use the `space_*` tools, never screenshots — they return
   exact numbers. `space_digest` inventories every body with kernel-exact
   volume/area/centroid; bodies get short handles (`b1`, `b2`, …).
+- **Sub-body granularity**: `fusion_find_geometry` scans faces/edges
+  analytically (find the ⌀3 holes: `kind='cylinder_face', radius=1.5`) and
+  returns self-healing handles (`f1`, `e2`) that feed fillet/chamfer/sketch-
+  plane/shell inputs and `fusion_measure_relation` — exact design-intent
+  verdicts like "is this hole coaxial with that boss?" (Patterns adapted
+  from [Fusion-Essentials](https://github.com/Philip-Mestenhauser/Fusion-Essentials),
+  MIT/Apache-2.0.)
 - **Authoring is parametric by default.** Every dimension input accepts a
   number (doc units), an expression (`"40 mm"`, `"width/2"`), or
   `{param: "wall_height", value: "40 mm"}` which creates a named user
@@ -86,6 +93,8 @@ numerically by the spatial tools.
 | Tool | Purpose |
 |---|---|
 | `fusion_document` | Orientation: doc, units, up-axis, timeline summary |
+| `fusion_find_geometry` | Analytic sub-body scan: faces/edges/vertices by kind/radius/nearest, self-healing handles |
+| `fusion_measure_relation` | Kernel-exact distance/angle + verdicts: coaxial, concentric, parallel, perpendicular, flush, clearance, touching |
 | `fusion_get_selection` | What the user has selected ("this face/body") |
 | `fusion_capture_viewport` | Viewport PNG (appearance; not for metrics) |
 | `fusion_list_parameters` / `fusion_set_parameters` | Read / drive user + model parameters (batch, health report) |
