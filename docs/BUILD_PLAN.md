@@ -1,5 +1,12 @@
 # fusion-spatial-mcp — Build Plan
 
+> **Historical document.** This plan was written before milestone F6 and is
+> kept as the project's design record. F6 has since happened: `spatial-core`
+> was extracted into its own public repo (sibling checkout `../spatial-core`,
+> https://github.com/aphollis/spatial-core), which is now the canonical home
+> of PROTOCOL.md, `contracts/`, and the conformance suite. Sibling-repo
+> references below are written relative to this repo's parent directory.
+
 **Goal:** a Fusion 360 MCP server, designed Fusion-native, with the full
 spatial reasoning harness.
 
@@ -29,20 +36,20 @@ context. Read the referenced files before implementing each phase.
 
 | Asset | Location | Role here |
 |---|---|---|
-| `spatial-core` package | `C:\Users\nerfd\rhino-gh-mcp\spatial\` | ALL spatial intelligence: BVH distance/containment/collision, voxels, sections, PNG ortho multiview, free-space fit, pixel pick. Platform-neutral by design; consume it, never fork it. |
-| Protocol contract | `C:\Users\nerfd\rhino-gh-mcp\spatial\PROTOCOL.md` | The wire protocol + TS API this project must satisfy. §1 defines the exact two commands the Fusion add-in must implement. |
-| JSON Schema contracts | `contracts/*.schema.json` (copied into THIS repo, canonical copy in rhino-gh-mcp) | Adapter conformance shapes for `space.bodies` / `space.tessellate`. |
-| Conformance suite | `tools/validate-protocol.mjs` (copied here) | Run against the Fusion add-in's listener; it must print CONFORMANT. This is the acceptance gate for Phase F2. Needs `npm i -D ajv`. |
-| Engineering patterns (MCP server) | `C:\Users\nerfd\rhino-gh-mcp\src\` | `bridge.ts` (TCP JSON-lines client), `spatial-adapter.ts` (base64 → typed arrays), `index.ts` spatial-tool section + annotation style. Reuse the *mechanics*; the Fusion tool vocabulary is designed fresh in §4. |
-| Engineering patterns (in-app bridge) | `C:\Users\nerfd\rhino-gh-mcp\rhino\mcp_listener.py` | JSON-lines TCP server, thread-per-connection, main-thread marshaling, sceneVersion in dispatcher, `space.*` handlers. Same mechanics apply; the command surface beyond `space.*` is Fusion's own. |
-| Ecosystem survey | `C:\Users\nerfd\rhino-gh-mcp\docs\community-mcp-survey.md` | Prior art. Key: Autodesk's MIT **FusionMCPSample** (CustomEvent threading to copy), ndoo/fusion360-mcp-bridge (best threading docs + Bearer auth), faust-machines (84-tool reference, MIT). Do NOT copy GPL (Joe-Spencer) or unlicensed code. |
-| Design rationale | `C:\Users\nerfd\rhino-gh-mcp\docs\RFD-001-spatial-reasoning.md` | Why the adapter is only two functions; §8b has Fusion-specific notes. |
-| Token-efficiency playbook | `C:\Users\nerfd\rhino-gh-mcp\docs\EFFICIENCY_PLAN.md` | Apply the same rules here from day one (alwaysLoad, cached static context, terse returns, handles, idempotency). |
+| `spatial-core` package | `../spatial-core/` (own repo since F6) | ALL spatial intelligence: BVH distance/containment/collision, voxels, sections, PNG ortho multiview, free-space fit, pixel pick. Platform-neutral by design; consume it, never fork it. |
+| Protocol contract | `../spatial-core/PROTOCOL.md` (canonical) | The wire protocol + TS API this project must satisfy. §1 defines the exact two commands the Fusion add-in must implement. |
+| JSON Schema contracts | `../spatial-core/contracts/*.schema.json` (canonical; consumed from the package) | Adapter conformance shapes for `space.bodies` / `space.tessellate`. |
+| Conformance suite | `../spatial-core/tools/validate-protocol.mjs` (run via `npm run conformance`) | Run against the Fusion add-in's listener; it must print CONFORMANT. This is the acceptance gate for Phase F2. Needs `npm i -D ajv`. |
+| Engineering patterns (MCP server) | `../rhino-gh-mcp/src/` | `bridge.ts` (TCP JSON-lines client), `spatial-adapter.ts` (base64 → typed arrays), `index.ts` spatial-tool section + annotation style. Reuse the *mechanics*; the Fusion tool vocabulary is designed fresh in §4. |
+| Engineering patterns (in-app bridge) | `../rhino-gh-mcp/rhino/mcp_listener.py` | JSON-lines TCP server, thread-per-connection, main-thread marshaling, sceneVersion in dispatcher, `space.*` handlers. Same mechanics apply; the command surface beyond `space.*` is Fusion's own. |
+| Ecosystem survey | `../rhino-gh-mcp/docs/community-mcp-survey.md` | Prior art. Key: Autodesk's MIT **FusionMCPSample** (CustomEvent threading to copy), ndoo/fusion360-mcp-bridge (best threading docs + Bearer auth), faust-machines (84-tool reference, MIT). Do NOT copy GPL (Joe-Spencer) or unlicensed code. |
+| Design rationale | `../rhino-gh-mcp/docs/RFD-001-spatial-reasoning.md` | Why the adapter is only two functions; §8b has Fusion-specific notes. |
+| Token-efficiency playbook | `../rhino-gh-mcp/docs/EFFICIENCY_PLAN.md` | Apply the same rules here from day one (alwaysLoad, cached static context, terse returns, handles, idempotency). |
 
-**spatial-core consumption:** npm `file:` dependency on
-`../rhino-gh-mcp/spatial` (works on this machine; both repos are siblings
-under `C:\Users\nerfd\`). Milestone F6 extracts spatial-core into its own repo
-when this dependency becomes annoying. Do not copy the source.
+**spatial-core consumption:** npm `file:` dependency on `../spatial-core`
+(sibling checkouts). Milestone F6 extracted spatial-core into its own repo,
+which is the canonical home of the protocol and contracts. Do not copy the
+source.
 
 ---
 
@@ -205,13 +212,12 @@ write any spatial tool code before it passes.
   asking** — same standing rule as Rhino. Compile/lint offline; batch live
   tests into agreed steps. Fusion has no headless mode; every live test
   touches the user's real app.
-- Validate Python by running `py_compile` with any CPython 3 (Rhino's works:
-  `C:\Users\nerfd\.rhinocode\py39-rh8\python.exe -m py_compile <file>`) —
+- Validate Python by running `py_compile` with any CPython 3.9+ —
   Fusion's bundled interpreter is 3.x; keep the add-in ≥3.9-compatible.
+  (Machine-specific tooling paths live in session memory, not here.)
 - Git identity: `aphollis <20403818+aphollis@users.noreply.github.com>`
-  (email privacy on). Portable git: `C:\Users\nerfd\tools\mingit\cmd`;
-  gh CLI: `C:\Users\nerfd\tools\ghcli\bin`. Node 22 on PATH. No system
-  Python. winget hangs on UAC — use portable installs.
+  (email privacy on). git/gh/Node assumed on PATH via portable installs;
+  no system Python. winget hangs on UAC — use portable installs.
 - Commit per milestone; benchmark before/after any efficiency claim.
 - MIT license (file present). Borrow only from MIT sources named in the
   survey; credit in comments where nontrivial patterns are copied.

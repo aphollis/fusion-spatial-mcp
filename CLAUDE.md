@@ -9,10 +9,10 @@ Hard rules:
 - **Design Fusion-native.** This project is not a port of the Rhino server:
   tool vocabulary, workflows, and agent guidance come from Fusion's own
   concepts (timeline, features, constrained sketches, user parameters,
-  components). The sibling repo `C:\Users\nerfd\rhino-gh-mcp` is an
-  infrastructure donor only: it is the home of `spatial-core` (consumed via
-  `file:` dependency — never fork/copy its source) and a source of
-  engineering patterns (TCP bridge, threading, token efficiency). Do not
+  components). The sibling checkout `../rhino-gh-mcp` is an infrastructure
+  donor only: a source of engineering patterns (TCP bridge, threading, token
+  efficiency). `spatial-core` lives in its own sibling repo `../spatial-core`
+  (consumed via `file:` dependency — never fork/copy its source). Do not
   carry Grasshopper concepts or names across.
 - Never run generated code against the user's live Fusion session without
   asking first. Compile-check offline; batch live testing into agreed steps.
@@ -26,4 +26,4 @@ Hard rules:
 - Fusion 360 is installed (webdeploy production). Dev add-ins folder:
   %APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns\ (user has prior add-in
   experience — "Sheeter" add-in and the FusionRhinoBar project).
-- Commit per milestone with concise messages; push to origin (private repo).
+- Commit per milestone with concise messages; push to origin (public repo).
